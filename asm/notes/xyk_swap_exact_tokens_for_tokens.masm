@@ -1,28 +1,29 @@
 use miden::protocol::active_note
+use zoro::asset_utils
 use zoro::xyk_pool
 use miden::core::sys
 
 const EXPECTED_NUM_ASSETS = 1
 const ERR_INVALID_NUM_ASSETS = "Expected exactly 1 asset for swap"
 
-#! Note inputs layout (12 felts stored at dest_ptr=0):
+#! Note storage layout (12 felts stored at dest_ptr=0):
 #!   mem[0..3]  = [0, 0, 0, min_amount_out]     → MIN_ASSET_OUT word
 #!   mem[4..7]  = [deadline, note_tag, note_type, 0]
 #!   mem[8..11] = [r0, r1, r2, r3]              → P2ID_SCRIPT_ROOT
 
-begin
-    exec.active_note::get_inputs
-    # => [num_inputs, dest_ptr]
-    drop drop
-
+@note_script
+pub proc main
+    push.0 exec.active_note::get_storage
+    # => [num_storage_items]
+    drop
     # Push P2ID_SCRIPT_ROOT word (mem[8..11])
-    padw mem_loadw_be.8
+    padw mem_loadw_le.8
     # => [P2ID_SCRIPT_ROOT]
 
-    # Push note_type, note_tag and (mem_load.4 is deadline but then we run out of space if we use it)
+    # Push note_type, note_tag
     mem_load.6 mem_load.5
     # => [note_tag, note_type, P2ID_SCRIPT_ROOT]
-    
+
     # Push MIN_ASSET_OUT word (mem[0..3])
     padw mem_loadw_le.0
     # => [MIN_ASSET_OUT_WORD, note_tag, note_type, P2ID_SCRIPT_ROOT]
@@ -30,18 +31,17 @@ begin
     # Load note asset to memory at ptr=40
     push.40 exec.active_note::get_assets
     # => [num_assets, 40, ...]
-    swap drop
+    #swap drop
     push.EXPECTED_NUM_ASSETS eq assert.err=ERR_INVALID_NUM_ASSETS
     # => [MIN_ASSET_OUT_WORD, deadline, note_tag, note_type, P2ID_SCRIPT_ROOT]
 
     # Load ASSET_IN word
-    padw mem_loadw_be.40
+    padw mem_loadw_le.44 padw mem_loadw_le.40 exec.asset_utils::compress_asset
     # => [ASSET_IN, MIN_ASSET_OUT_WORD, note_tag, note_type, P2ID_SCRIPT_ROOT]
 
     # load user_id (sender)
     exec.active_note::get_sender
-    # => [sender_prefix, sender_suffix, ASSET_IN, MIN_ASSET_OUT_WORD, note_tag, note_type, P2ID_SCRIPT_ROOT]
-
+    # => [sender_suffix, sender_prefix, ASSET_IN, MIN_ASSET_OUT_WORD, note_tag, note_type, P2ID_SCRIPT_ROOT]
     call.xyk_pool::swap_exact_tokens_for_tokens
     exec.sys::truncate_stack
 end

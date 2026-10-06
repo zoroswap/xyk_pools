@@ -4,7 +4,7 @@ use miden::protocol::active_note
 use miden::protocol::output_note
 #use miden::protocol::asset
 use miden::core::sys
-use miden::core::math::u64
+use miden::core::math::u128
 
 use miden::protocol::note
 use miden::protocol::account_id
@@ -13,6 +13,7 @@ use miden::protocol::account_id
 use zoro::math
 #use zoro::storage_utils
 use zoro::lp_local
+use zoro::asset_utils
 
 #use lp_local::set_reserves
 pub use lp_local::get_pool_asset_ids
@@ -30,17 +31,19 @@ const RESERVE_SLOT = word("zoro::lp_local::reserve")
 
 const ERR_INSUFFICIENT_OUTPUT = "Insufficient output"
 const ERR_ZERO_AMOUNT = "Zero amount"
+const ERR_UNDERFLOW = "Underflow"
+const ERR_OVERFLOW = "Overflow"
 
 
 ### MEMORY LOCATIONS
 const ASSET_IN_WORD = 20
-const ASSET_IN_ID_PREFIX = 20
-const ASSET_IN_ID_SUFFIX = 21
+const ASSET_IN_ID_SUFFIX = 20
+const ASSET_IN_ID_PREFIX = 21
 const AMOUNT_IN = 23
 
 const ASSET_OUT_WORD = 28
-const ASSET_OUT_ID_PREFIX = 28
-const ASSET_OUT_ID_SUFFIX = 29
+const ASSET_OUT_ID_SUFFIX = 28
+const ASSET_OUT_ID_PREFIX = 29
 const AMOUNT_OUT = 31
 
 ## NOTE METADATA
@@ -56,112 +59,142 @@ const RETURN_NOTE_ASSET_ID_SUFFIX = 41
 const RETURN_NOTE_AMOUNT = 43
 
 const USER_ACCOUNT_ID_WORD = 48
-const USER_ACCOUNT_ID_PREFIX = 48
-const USER_ACCOUNT_ID_SUFFIX = 49
+const USER_ACCOUNT_ID_SUFFIX = 48
+const USER_ACCOUNT_ID_PREFIX = 49
 const INPUT_NOTE_SERIAL = 52
 
 pub proc quote(amount_A: felt, reserve_A: felt, reserve_B: felt) -> felt
     # => [amount_A, reserve_A, reserve_B]
-    u32split
-    # => [amount_A_high, amount_A_low, reserve_A, reserve_B]
-    movup.3
-    # => [ reserve_B, amount_A_hi, amount_A_lo, reserve_A]
-    u32split
-    # => [reserve_B_high, reserve_B_low, amount_A_hi, amount_A_lo, reserve_A]
-    exec.u64::wrapping_mul
-    # => [numerator_high, numerator_low, reserve_A]
     movup.2
-    # => [reserve_A, numerator_high, numerator_low]
-    u32split
-    # => [reserve_A_high, reserve_A_low, numerator_high, numerator_low]
-    exec.u64::div
-    # => [amount_B_high, amount_B_low]
-    exec.math::safe_cast_u64_into_felt
+    # => [reserve_B, amount_A, reserve_A]
+    movup.2
+    # => [reserve_A, reserve_B, amount_A]
+    # amount_B = amount_A * reserve_B / reserve_A
+    exec.math::mul_div
     # => [amount_B]
     exec.sys::truncate_stack
-end 
+end
 
 
 #@todo factor out fee amount and make it configurable
-@locals(6)
+const GAO_AMOUNT_IN = 0
+const GAO_RESERVE_IN = 1
+const GAO_RESERVE_OUT = 2
+const GAO_FEE = 4
+const GAO_NUM = 8
+@locals(12)
 pub proc get_amount_out_u64(amount_in: felt, reserve_in: felt, reserve_out: felt) -> felt
-    # loc.0: reserve_in
-    # loc.1: reserve_out
-    # loc.2: amount_in
-    # loc.3: unused
-    # loc.4: amount_in_with_fee_high
-    # loc.5: amount_in_with_fee_low
- 
-    loc_store.2 loc_store.0 loc_store.1
-    
-    # amount_in
-    loc_load.2 u32split 
-    # => [amount_in_high, amount_in_low]
-    push.997 u32split
-    # => [997_high, 997_low, amount_in_high, amount_in_low]
-    # @note: consider overflowing mul
-    exec.u64::wrapping_mul
-    # => [amount_in_with_fee_high, amount_in_with_fee_low]
-    loc_store.4 loc_store.5 loc_load.5 loc_load.4
-    # => [amount_in_with_fee_high, amount_in_with_fee_low]
-    ## reserve_out 
-    loc_load.1 u32split 
-    # => [reserve_out_high, reserve_out_low, amount_in_with_fee_high, amount_in_with_fee_low]
-    # numerator = amount_in_with_fee * reserve_out
-    exec.u64::wrapping_mul
-    # => [numerator_high, numerator_low]
-    # reserve_in
-    loc_load.0 u32split push.1000 u32split exec.u64::wrapping_mul
-    # => [reserve_in_scaled_high, reserve_in_scaled_low, numerator_high, numerator_low]
-    # amount_in_with_fee
-    loc_load.5 loc_load.4
-    # => [amount_in_with_fee_high, amount_in_with_fee_low, reserve_in_scaled_high, reserve_in_scaled_low, numerator_high, numerator_low]
-    # denominator = reserve_in_scaled + amount_in_with_fee
-    exec.u64::wrapping_add
-    # => [denominator_high, denominator_low, numerator_high, numerator_low]
-    exec.u64::div
-    # => [amount_out_high, amount_out_low]
-    exec.math::safe_cast_u64_into_felt
+    # => [amount_in, reserve_in, reserve_out]
+    loc_store.GAO_AMOUNT_IN
+    # => [reserve_in, reserve_out]
+    loc_store.GAO_RESERVE_IN
+    # => [reserve_out]
+    loc_store.GAO_RESERVE_OUT
+    # => []
+
+    # fee = amount_in * 997
+    loc_load.GAO_AMOUNT_IN exec.math::felt_to_u128
+    # => [amount_in_u128]
+    push.0.0.0.997
+    # => [997, amount_in_u128]
+    exec.u128::overflowing_mul
+    # => [overflow, fee]
+    eq.0 assert.err=ERR_OVERFLOW
+    # => [FEE]
+    loc_storew_le.GAO_FEE
+    # => [FEE]
+
+    # numerator = fee * reserve_out
+    loc_load.GAO_RESERVE_OUT exec.math::felt_to_u128
+    # => [RESERVE_OUT_U128, FEE]
+    exec.u128::overflowing_mul
+    # => [overflow, NUMERATOR]
+    eq.0 assert.err=ERR_OVERFLOW
+    # => [NUMERATOR]
+    loc_storew_le.GAO_NUM
+    # => [NUMERATOR]
+
+    # denominator = reserve_in * 1000 + fee
+    loc_load.GAO_RESERVE_IN exec.math::felt_to_u128
+    push.0.0.0.1000
+    # => [0.0.0.1000, RESERVE_IN_U128]
+    exec.u128::overflowing_mul
+    # => [overflow, RESERVE_IN_SCALED]
+    eq.0 assert.err=ERR_OVERFLOW
+    # => [RESERVE_IN_SCALED]
+    padw loc_loadw_le.GAO_FEE
+    # => [FEE, RESERVE_IN_SCALED]
+    exec.u128::overflowing_add
+    # => [overflow, denominator]
+    eq.0 assert.err=ERR_OVERFLOW
+    # => [denominator]
+    loc_storew_le.GAO_FEE dropw
+    # => []
+
+    padw loc_loadw_le.GAO_NUM
+    # => [numerator]
+    padw loc_loadw_le.GAO_FEE
+    # => [denominator, numerator]
+    exec.u128::div
+    # => [amount_out_u128]
+    exec.math::safe_cast_u128_into_felt
     # => [amount_out]
     exec.sys::truncate_stack
 end
 
-@locals(3)
+#@todo factor out fee amount and make it configurable
+const GAI_AMOUNT_OUT = 0
+const GAI_RESERVE_IN = 1
+const GAI_RESERVE_OUT = 2
+const GAI_SCALED = 4
+const GAI_NUM = 8
+@locals(12)
 pub proc get_amount_in_u64(amount_out: felt, reserve_in: felt, reserve_out: felt) -> felt
-    # loc.0: reserve_in
-    # loc.1: reserve_out
-    # loc.2: amount_out
+    # => [amount_out, reserve_in, reserve_out]
+    loc_store.GAI_AMOUNT_OUT
+    # => [reserve_in, reserve_out]
+    loc_store.GAI_RESERVE_IN
+    # => [reserve_out]
+    loc_store.GAI_RESERVE_OUT
+    # => []
 
-    loc_store.2 loc_store.0 loc_store.1
-    
-    # amount_out
-    loc_load.2 u32split 
-    # => [amount_out_high, amount_out_low]
-    push.1000 u32split
-    # => [1000_high, 1000_low, amount_out_high, amount_out_low]
-    # @note: consider overflowing mul
-    exec.u64::wrapping_mul
-    # => [amount_out_scaled_high, amount_out_scaled_low]
-    ## reserve_in 
-    loc_load.0 u32split 
-    # => [reserve_in_high, reserve_in_low, amount_out_scaled_high, amount_out_scaled_low]
-    # numerator = amount_out_scaled * reserve_in
-    exec.u64::wrapping_mul
-    # => [numerator_scaled_high, numerator_scaled_low]
-    ## denominator = (reserve_out - amount_out) * (1-fee)
-    ## reserve_out
-    loc_load.1 u32split 
-    # => [reserve_out_high, reserve_out_low, numerator_scaled_high, numerator_scaled_low]
-    ## amount_out
-    loc_load.2 u32split
-    # => [amount_out_high, amount_out_low, reserve_out_high, reserve_out_low, numerator_scaled_high, numerator_scaled_low]
-    exec.u64::wrapping_sub
-    # => [denominator_high, denominator_low, numerator_scaled_high, numerator_scaled_low]
-    push.997 u32split exec.u64::wrapping_mul
-    # => [denominator_with_fee_high, denominator_with_fee_low, numerator_high, numerator_low]
-    exec.u64::div
-    # => [amount_in_high, amount_in_low]
-    exec.math::safe_cast_u64_into_felt
+    # numerator = amount_out * 1000 * reserve_in
+    loc_load.GAI_AMOUNT_OUT exec.math::felt_to_u128
+    push.0.0.0.1000
+    exec.u128::overflowing_mul
+    # => [overflow, amount_out_scaled]
+    eq.0 assert.err=ERR_OVERFLOW
+    # => [amount_out_scaled]
+    loc_storew_le.GAI_SCALED dropw
+    padw loc_loadw_le.GAI_SCALED
+    loc_load.GAI_RESERVE_IN exec.math::felt_to_u128
+    exec.u128::overflowing_mul
+    # => [overflow, numerator]
+    eq.0 assert.err=ERR_OVERFLOW
+    # => [numerator]
+    loc_storew_le.GAI_NUM dropw
+    # => []
+
+    # denominator = (reserve_out - amount_out) * 997
+    loc_load.GAI_RESERVE_OUT exec.math::felt_to_u128
+    loc_load.GAI_AMOUNT_OUT exec.math::felt_to_u128
+    # => [amount_out_u128, reserve_out_u128]
+    exec.u128::overflowing_sub
+    # => [underflow, difference]
+    eq.0 assert.err=ERR_UNDERFLOW
+    # => [difference]
+    push.0.0.0.997
+    exec.u128::overflowing_mul
+    # => [overflow, denominator]
+    eq.0 assert.err=ERR_OVERFLOW
+    # => [denominator]
+    loc_storew_le.GAI_SCALED dropw
+
+    padw loc_loadw_le.GAI_NUM
+    padw loc_loadw_le.GAI_SCALED
+    # => [denominator, numerator]
+    exec.u128::div
+    exec.math::safe_cast_u128_into_felt
     # => [amount_in]
     exec.sys::truncate_stack
 end
@@ -169,38 +202,34 @@ end
 
 
 @locals(2)
-pub proc swap_exact_tokens_for_tokens(note_serial: word, user_id_prefix: felt, user_id_suffix: felt, asset_in: word, min_asset_out: word, note_tag: felt, note_type: felt, p2id_script_root: word) -> felt
+pub proc swap_exact_tokens_for_tokens(user_id_prefix: felt, user_id_suffix: felt, asset_in: word, min_asset_out: word, note_tag: felt, note_type: felt, p2id_script_root: word) -> felt
 
     # Initial stack
-    # => [sender_prefix, sender_suffix, ASSET_IN, MIN_ASSET_OUT_WORD, note_tag, note_type, P2ID_SCRIPT_ROOT]
-
-    # get SERIAL of this note
-    exec.active_note::get_serial_number
+    # => [user_suf, user_pre, ASSET_IN, MIN_ASSET_OUT, note_tag, note_type, P2ID_SCRIPT_ROOT]
+  
     # => [serial_num, sender_prefix, sender_suffix, ASSET_IN, MIN_ASSET_OUT_WORD, note_tag, note_type, P2ID_SCRIPT_ROOT]
- 
+    exec.active_note::get_serial_number mem_storew_le.INPUT_NOTE_SERIAL dropw
+    # => [serial_num, sender_prefix, sender_suffix, ASSET_IN, MIN_ASSET_OUT_WORD, note_tag, note_type, P2ID_SCRIPT_ROOT]
+    
     # store user account id
-    mem_storew_le.INPUT_NOTE_SERIAL dropw
-
-    # store user account id
-    mem_store.USER_ACCOUNT_ID_PREFIX mem_store.USER_ACCOUNT_ID_SUFFIX
-
+    mem_store.USER_ACCOUNT_ID_SUFFIX mem_store.USER_ACCOUNT_ID_PREFIX
     ### mem store asset in, min asset out
     mem_storew_le.ASSET_IN_WORD dropw mem_storew_le.ASSET_OUT_WORD dropw
-
     ### store note metadata in memory
     mem_store.RETURN_NOTE_TAG mem_store.RETURN_NOTE_TYPE mem_storew_le.P2ID_SCRIPT_ROOT dropw
-
-    mem_load.ASSET_OUT_ID_SUFFIX mem_load.ASSET_OUT_ID_PREFIX 
+   
+    mem_load.ASSET_OUT_ID_PREFIX mem_load.ASSET_OUT_ID_SUFFIX
     exec.get_reserve_by_asset_id
     # => [reserve_out]
-    mem_load.ASSET_IN_ID_SUFFIX mem_load.ASSET_IN_ID_PREFIX 
+    mem_load.ASSET_IN_ID_PREFIX mem_load.ASSET_IN_ID_SUFFIX
     exec.get_reserve_by_asset_id
     # => [reserve_in, reserve_out]
     mem_load.AMOUNT_IN
-    # => [amount_in, reserve_in, reserve_out]
-    exec.get_amount_out_u64 loc_store.1 loc_load.1
+    # => [amount_in, reserve_in, reserve_out]    
+    exec.get_amount_out_u64 dup loc_store.1
     # => [amount_out]
     mem_load.AMOUNT_OUT
+
     # => [min_amount_out, amount_out]
     gte
     if.true # sufficient amount out
@@ -211,6 +240,7 @@ pub proc swap_exact_tokens_for_tokens(note_serial: word, user_id_prefix: felt, u
         mem_storew_le.RETURN_NOTE_ASSET_WORD dropw
         ### add ASSEET IN to the pool
         padw mem_loadw_le.ASSET_IN_WORD
+        exec.asset_utils::expand_asset
         exec.native_account::add_asset dropw
         # => []
         ### update reserve
@@ -235,36 +265,35 @@ pub proc swap_exact_tokens_for_tokens(note_serial: word, user_id_prefix: felt, u
 end
 
 @locals(3)
-pub proc swap_tokens_for_exact_tokens(user_id_prefix: felt, user_id_suffix: felt, asset_out: word, max_asset_in: word, note_tag: felt, note_type: felt, p2id_script_root: word) -> felt
-
+pub proc swap_tokens_for_exact_tokens(user_id_suffix: felt, user_id_prefix: felt, asset_max_asset_in: word, out: word, note_tag: felt, note_type: felt, p2id_script_root: word) -> felt
+    # loc.0: ??
+    # loc.1: amount_in
+    # loc.2: remaining_amount_in
     # Initial stack
-    # => [sender_prefix, sender_suffix, ASSET_IN, MIN_ASSET_OUT_WORD, note_tag, note_type, P2ID_SCRIPT_ROOT]
+    # => [sender_suffix, sender_prefix , ASSET_IN_MAX, ASSET_OUT, note_tag, note_type, P2ID_SCRIPT_ROOT]
 
     # get SERIAL of this note
-    exec.active_note::get_serial_number
+    exec.active_note::get_serial_number mem_storew_le.INPUT_NOTE_SERIAL dropw
     # => [serial_num, sender_prefix, sender_suffix, ASSET_IN, MIN_ASSET_OUT_WORD, note_tag, note_type, P2ID_SCRIPT_ROOT]
  
     # store user account id
-    mem_storew_le.INPUT_NOTE_SERIAL dropw
-
-    # store user account id
-    mem_store.USER_ACCOUNT_ID_PREFIX mem_store.USER_ACCOUNT_ID_SUFFIX
-
+    mem_store.USER_ACCOUNT_ID_SUFFIX mem_store.USER_ACCOUNT_ID_PREFIX
     ### mem store asset in, min asset out
-    mem_storew_le.ASSET_OUT_WORD dropw mem_storew_le.ASSET_IN_WORD dropw
+  
+    mem_storew_le.ASSET_IN_WORD dropw mem_storew_le.ASSET_OUT_WORD dropw
 
     ### store note metadata in memory
     mem_store.RETURN_NOTE_TAG mem_store.RETURN_NOTE_TYPE mem_storew_le.P2ID_SCRIPT_ROOT dropw
 
-    mem_load.ASSET_OUT_ID_SUFFIX mem_load.ASSET_OUT_ID_PREFIX 
+    mem_load.ASSET_OUT_ID_PREFIX mem_load.ASSET_OUT_ID_SUFFIX 
     exec.get_reserve_by_asset_id
     # => [reserve_out]
-    mem_load.ASSET_IN_ID_SUFFIX mem_load.ASSET_IN_ID_PREFIX 
+    mem_load.ASSET_IN_ID_PREFIX mem_load.ASSET_IN_ID_SUFFIX 
     exec.get_reserve_by_asset_id
     # => [reserve_in, reserve_out]
     mem_load.AMOUNT_OUT
     # => [amount_out, reserve_in, reserve_out]
-    exec.get_amount_in_u64 loc_store.1 loc_load.1
+    exec.get_amount_in_u64 dup loc_store.1
     # => [amount_in]
     mem_load.AMOUNT_IN
     # => [max_amount_in, amount_in]
@@ -282,6 +311,7 @@ pub proc swap_tokens_for_exact_tokens(user_id_prefix: felt, user_id_suffix: felt
         mem_storew_le.RETURN_NOTE_ASSET_WORD dropw
         ### add ASSEET IN to the pool
         padw mem_loadw_le.ASSET_IN_WORD
+        exec.asset_utils::expand_asset
         exec.native_account::add_asset dropw
         # => []
         ### update reserve
@@ -301,16 +331,25 @@ pub proc swap_tokens_for_exact_tokens(user_id_prefix: felt, user_id_suffix: felt
     end
     exec._create_p2id_note
     # => [note_id]
-    ### add remaining amount in to the note to be returned to the user
-    padw mem_loadw_le.ASSET_IN_WORD
-    # => [ASSET_IN, note_id]
-    loc_load.2
-    # => [remaining_amount_in, ASSET_IN, note_id]
-    swap.4 drop
-    # => [REMAINING_ASSET_IN, note_id]
-    exec.output_note::add_asset
-    # => [note_id]
-    drop
+    ### add remaining amount in to the note to be returned to the user if any
+    loc_load.2 
+     # => [remaining_amount_in, note_id]
+    gt.0 if.true
+        padw mem_loadw_le.ASSET_IN_WORD
+        # => [ASSET_IN, note_id]
+        loc_load.2
+        # => [remaining_amount_in, ASSET_IN, note_id]
+        swap.4 drop
+        # => [REMAINING_ASSET_IN, note_id]
+        exec.asset_utils::expand_asset
+        exec.output_note::add_asset
+        # => [note_id]
+        drop
+    else
+        # => [note_id]
+        drop
+    end
+       
 end
 
 proc compute_return_note_serial_num() -> word
@@ -321,34 +360,29 @@ proc compute_return_note_serial_num() -> word
 end
 
 #### HELPER PROCEDURES
+# loc.0: note_id
 @locals(1)
 proc _create_p2id_note() -> felt
     padw mem_loadw_le.P2ID_SCRIPT_ROOT
-   
     exec.compute_return_note_serial_num
     mem_load.USER_ACCOUNT_ID_SUFFIX mem_store.0
     mem_load.USER_ACCOUNT_ID_PREFIX mem_store.1
     push.2 push.0
 
     ## => [inputs_ptr, number_of_inputs, RETURN_SERIAL_NUM, P2ID_SCRIPT_ROOT]
-    exec.note::build_recipient
+    exec.note::compute_and_store_recipient
     # => [RECIPIENT]
-
     mem_load.RETURN_NOTE_TYPE mem_load.RETURN_NOTE_TAG
-    # => [note_type, note_tag, RECIPIENT]
-
+    # => [note_tag, note_type, RECIPIENT]
     exec.output_note::create loc_store.0 
     # => []
-
     padw mem_loadw_le.RETURN_NOTE_ASSET_WORD
-    exec.native_account::remove_asset 
-    # => [ASSET]
-    loc_load.0 movdn.4
-    # => [ASSET1_OUT, note_id]
+    exec.asset_utils::expand_asset
+    exec.native_account::remove_asset dropw
+    padw mem_loadw_le.RETURN_NOTE_ASSET_WORD
+    exec.asset_utils::expand_asset
+    loc_load.0 movdn.8
     exec.output_note::add_asset
-    # => [note_id]
-    loc_load.0
-    # => [note_id]
     exec.sys::truncate_stack
 end
 

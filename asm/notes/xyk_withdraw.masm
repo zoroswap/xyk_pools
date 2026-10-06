@@ -5,12 +5,14 @@ use miden::core::sys
 const EXPECTED_NUM_INPUTS = 12
 const ERR_INVALID_NUM_INPUTS = "Invalid number of inputs"
 
-begin
-    exec.active_note::get_inputs
-    # => [num_inputs, dest_ptr]
+@note_script
+pub proc main
+    push.0 exec.active_note::get_storage
+    # => [num_storage_items]
     push.EXPECTED_NUM_INPUTS eq assert.err=ERR_INVALID_NUM_INPUTS
+    # => []
 
-    # note_inputs layout (dest_ptr = 0):
+    # note storage layout (dest_ptr = 0):
     #   mem[0] = [lp_amount, 0, 0, 0]           (word 0)
     #   mem[4] = [note_tag, note_type, 0, 0]     (word 1)
     #   mem[8] = [OUTPUT_NOTE_ROOT_HASH]         (word 2)
@@ -18,8 +20,8 @@ begin
     # get SERIAL of this note
     exec.active_note::get_serial_number
     # => [SERIAL_NUM]
-    # load OUTPUT NOTE ROOT HASH 
-    padw mem_loadw_be.8
+    # load OUTPUT NOTE ROOT HASH
+    padw mem_loadw_le.8
     # => [OUTPUT_NOTE_ROOT_HASH, SERIAL_NUM]
     # load note_type and note_tag
     mem_load.5 mem_load.4

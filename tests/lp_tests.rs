@@ -1,7 +1,6 @@
 use anyhow::Result;
 use miden_client::{
     Felt, Word,
-    store::AccountRecordData,
     transaction::{AdviceInputs, TransactionRequestBuilder},
 };
 use xyk_pool::{
@@ -13,7 +12,7 @@ use xyk_pool::{
     utils::slot_name,
 };
 
-use std::{collections::BTreeSet, time::Duration};
+use std::{collections::BTreeMap, time::Duration};
 
 #[tokio::test]
 async fn get_lp_amount_out_fuzz_test() -> Result<()> {
@@ -29,11 +28,14 @@ async fn get_lp_amount_out_fuzz_test() -> Result<()> {
     let lp_local_library = get_lp_local_library()?;
     let mut rng = rand::rng();
 
+    let felt_max: u64 = u64::MAX - u32::MAX as u64;
     let edge_cases: Vec<(u64, u64, u64, u64, u64)> = vec![
         (0, 100, 100, 0, 0),
         (0, 1_000_000, 1_000_000, 0, 0),
+        (0, felt_max, felt_max, 0, 0),
         (1000, 100, 100, 1000, 1000),
         (10000, 500, 500, 50000, 50000),
+        (felt_max, felt_max, felt_max, felt_max, felt_max),
     ];
 
     for (i, (total_supply, amount_0, amount_1, reserve_0, reserve_1)) in edge_cases
@@ -83,11 +85,11 @@ async fn get_lp_amount_out_fuzz_test() -> Result<()> {
                 setup.contract.id(),
                 script.clone(),
                 AdviceInputs::default(),
-                BTreeSet::new(),
+                BTreeMap::new(),
             )
             .await?;
 
-        let got = stack[0].as_int();
+        let got = stack[0].as_canonical_u64();
         let expected = compute_expected_lp(amount_0, amount_1, reserve_0, reserve_1, total_supply);
 
         if got == expected {
@@ -137,11 +139,13 @@ async fn simulate_withdraw_fuzz_test() -> Result<()> {
     let lp_local_library = get_lp_local_library()?;
     let mut rng = rand::rng();
 
+    let felt_max: u64 = u64::MAX - u32::MAX as u64;
     let edge_cases: Vec<(u64, u64, u64, u64)> = vec![
         (100, 100, 100, 0),
         (1_000_000, 1_000_000, 1_000_000, 0),
         (1000, 100, 100, 1000),
         (10000, 500, 500, 50000),
+        (felt_max, felt_max, felt_max, felt_max),
     ];
 
     for (i, (total_supply, lp_amount, reserve_0, reserve_1)) in edge_cases
@@ -191,11 +195,11 @@ async fn simulate_withdraw_fuzz_test() -> Result<()> {
                 setup.contract.id(),
                 script.clone(),
                 AdviceInputs::default(),
-                BTreeSet::new(),
+                BTreeMap::new(),
             )
             .await?;
 
-        let got = (stack[0].as_int(), stack[1].as_int());
+        let got = (stack[0].as_canonical_u64(), stack[1].as_canonical_u64());
 
         println!(
             "[{}] ts={} lp={} ar0={} r1={} => got=({},{}), expected=({},{})",
@@ -247,9 +251,9 @@ async fn lp_local_asset_getters_test() -> Result<()> {
              call.lp_local::get_asset_index\n\
              exec.sys::truncate_stack\n\
          end",
-        token1_id.suffix().as_int(),
+        token1_id.suffix().as_canonical_u64(),
         token1_id.prefix().as_u64(),
-        token0_id.suffix().as_int(),
+        token0_id.suffix().as_canonical_u64(),
         token0_id.prefix().as_u64()
     );
 
@@ -263,11 +267,11 @@ async fn lp_local_asset_getters_test() -> Result<()> {
             setup.contract.id(),
             script.clone(),
             AdviceInputs::default(),
-            BTreeSet::new(),
+            BTreeMap::new(),
         )
         .await?;
 
-    let got: Vec<u64> = stack[0..2].iter().map(|x| x.as_int()).collect();
+    let got: Vec<u64> = stack[0..2].iter().map(|x| x.as_canonical_u64()).collect();
 
     assert_eq!(
         got, expected,
@@ -318,9 +322,9 @@ async fn lp_local_reserve_by_asset_id_test() -> Result<()> {
                  exec.sys::truncate_stack\n\
              end",
             t0_prefix = token0_id.prefix().as_u64(),
-            t0_suffix = token0_id.suffix().as_int(),
+            t0_suffix = token0_id.suffix().as_canonical_u64(),
             t1_prefix = token1_id.prefix().as_u64(),
-            t1_suffix = token1_id.suffix().as_int(),
+            t1_suffix = token1_id.suffix().as_canonical_u64(),
         );
 
         let script = compile_custom_tx_script(&lp_local_library, &source)?;
@@ -332,12 +336,12 @@ async fn lp_local_reserve_by_asset_id_test() -> Result<()> {
                 setup.contract.id(),
                 script,
                 AdviceInputs::default(),
-                BTreeSet::new(),
+                BTreeMap::new(),
             )
             .await?;
 
-        let reserve_0 = stack[0].as_int();
-        let reserve_1 = stack[1].as_int();
+        let reserve_0 = stack[0].as_canonical_u64();
+        let reserve_1 = stack[1].as_canonical_u64();
         let expected_reserve_0 = start_reserves_0 + add_to_token0_amount;
         let expected_reserve_1 = start_reserves_1 - sub_from_token1_amount;
         println!(
@@ -391,7 +395,7 @@ async fn lp_local_reserve_by_asset_id_unknown_asset_fails_test() -> Result<()> {
             setup.contract.id(),
             script,
             AdviceInputs::default(),
-            BTreeSet::new(),
+            BTreeMap::new(),
         )
         .await;
 
@@ -445,15 +449,15 @@ async fn lp_mint_fuzz_test() -> Result<()> {
                 setup.contract.id(),
                 script.clone(),
                 AdviceInputs::default(),
-                BTreeSet::new(),
+                BTreeMap::new(),
             )
             .await?;
 
         expected_total_supply = expected_total_supply.saturating_add(amount);
         expected_user_balance = expected_user_balance.saturating_add(amount);
 
-        let total_supply = stack[0].as_int();
-        let user_deposit = stack[1].as_int();
+        let total_supply = stack[0].as_canonical_u64();
+        let user_deposit = stack[1].as_canonical_u64();
 
         println!(
             "[{}/{}] mint amount={} => total_supply={}, user_deposit={} (expected {} {})",
@@ -542,13 +546,9 @@ async fn lp_burn_fuzz_test() -> Result<()> {
         .get_account(setup.contract.id())
         .await?
         .unwrap();
-    let acc_after = match acc_after.account_data() {
-        AccountRecordData::Full(account) => account,
-        AccountRecordData::Partial(_) => return Err(anyhow::anyhow!("Account not found")),
-    };
 
     let acc_after_storage = acc_after.storage();
-    let usr_key = Word::new([Felt::new(0), Felt::new(0), suffix, prefix]);
+    let usr_key = Word::new([Felt::ZERO, Felt::ZERO, suffix, prefix]);
     let usr_depo = acc_after_storage
         .get_map_item(&slot_name("zoro::lp_local::user_deposits_mapping"), usr_key)?;
     println!("usr_depo: after mint {:?}", usr_depo);
@@ -589,15 +589,15 @@ async fn lp_burn_fuzz_test() -> Result<()> {
                 setup.contract.id(),
                 script.clone(),
                 AdviceInputs::default(),
-                BTreeSet::new(),
+                BTreeMap::new(),
             )
             .await?;
 
         expected_total_supply = expected_total_supply.saturating_sub(burn_amount);
         expected_user_balance = expected_user_balance.saturating_sub(burn_amount);
 
-        let total_supply = stack[0].as_int();
-        let user_deposit = stack[1].as_int();
+        let total_supply = stack[0].as_canonical_u64();
+        let user_deposit = stack[1].as_canonical_u64();
 
         println!(
             "[{}/{}] burn amount={} => total_supply={}, user_deposit={} (expected {} {})",

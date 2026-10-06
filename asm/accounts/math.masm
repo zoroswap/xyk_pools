@@ -1,4 +1,5 @@
 use miden::core::math::u64
+use miden::core::math::u128
 use miden::core::sys
 
 const ERR_UNDERFLOW = "Underflow"
@@ -36,89 +37,188 @@ pub proc sqrt_u32(n: u32) -> u32    # floor(sqrt(n)) via bit-by-bit construction
     exec.sys::truncate_stack
 end
 
+#! Inputs: [felt]
+#! Outputs: [a0, a1, a2, a3] with a0 the least-significant limb.
+pub proc felt_to_u128(n: felt) -> u128
+    # => [felt]
+    push.0.0
+    # => [0, 0, felt]
+    movup.2
+    # => [felt, 0, 0]
+    u32split
+    # => [lo, hi, 0, 0]
+end
 
-@locals(8)
-pub proc sqrt(n: felt) -> felt
-    # floor(sqrt(n)) via bit-by-bit construction.
-    # For any u32 candidate c, c^2 < field prime p, so felt mul is exact.
-    #
-    # loc.0: n_hi   loc.1: n_lo   loc.2: result_hi     loc.3: result_lo
-    # loc.4: bit_hi loc.5: bit_lo loc.6: tmp_hi loc.7: tmp_lo
-    u32split loc_store.0 loc_store.1
-    push.0.0 loc_store.2 loc_store.3# result starts as 0
-    push.0x4000000000000000  u32split loc_store.4 loc_store.5  # bit starts as 1<<62
-    push.0.0 loc_store.6 loc_store.7 # tmp starts as 0
+#! Cast a u128 into a felt. Panics if the high 64 bits are set,
+#! or if the low 64 bits are not a valid field element.
+const CAST_LO = 0
+const CAST_HI = 1
+const CAST_SCALED = 2
+const CAST_RES = 3
+@locals(4)
+pub proc safe_cast_u128_into_felt(a: u128) -> felt
+    # => [a0, a1, a2, a3]
+    loc_store.CAST_LO loc_store.CAST_HI
+    # => [a2, a3]
+    eq.0 assert.err=ERR_OVERFLOW
+    eq.0 assert.err=ERR_OVERFLOW
+    # => []
+    loc_load.CAST_HI
+    # => [a_hi]
+    mul.U32_BOUND dup loc_store.CAST_SCALED
+    # => [hi_scaled]
+    loc_load.CAST_HI gte assert.err=ERR_OVERFLOW
+    # => []
+    loc_load.CAST_LO
+    # => [a_lo]
+    loc_load.CAST_SCALED
+    # => [hi_scaled, a_lo]
+    add dup loc_store.CAST_RES
+    # => [res]
+    loc_load.CAST_SCALED gte assert.err=ERR_OVERFLOW
+    # => []
+    loc_load.CAST_RES
+    # => [felt]
+end
 
-    repeat.32
-        ###  tmp = result + bit
-        loc_load.3 loc_load.2
-        # => [res_hi, res_lo]
-        loc_load.5 loc_load.4
-        # => [bit_hi, bit_lo, res_hi, res_lo]
-        exec.u64::wrapping_add loc_store.6 loc_store.7
-
-        ###  compare n >= result + bit   (n >= tmp)
-        loc_load.1 loc_load.0
-        # => [n_hi, n_lo]
-        loc_load.7 loc_load.6
-        # => [tmp_hi, tmp_lo, n_hi, n_lo]
-        exec.u64::gte
-        if.true
-            ### n = n - (result + bit)  
-            ### n = n - tmp
-            loc_load.1 loc_load.0
-            # => [n_hi, n_lo]
-            loc_load.7 loc_load.6
-            # => [tmp_hi, tmp_lo, n_hi, n_lo]
-            exec.u64::wrapping_sub loc_store.0 loc_store.1
-            
-            ### result = result + bit
-            loc_load.5 loc_load.4
-            # => [bit_hi, bit_lo]
-            loc_load.3 loc_load.2 push.1 exec.u64::shr
-            # => [res_hi, res_lo, bit_hi, bit_lo]
-            exec.u64::wrapping_add loc_store.2 loc_store.3
-
-        else
-            ### result = result >> 1
-            loc_load.3 loc_load.2 push.1 exec.u64::shr loc_store.2 loc_store.3
-        
-        end
-       
-        ### bit = bit >> 2
-        loc_load.5 loc_load.4
-        # => [bit_hi, bit_lo]
-        push.2 exec.u64::shr loc_store.4 loc_store.5
-       
-    end
-    ### return result
-    loc_load.3 loc_load.2
-    exec.safe_cast_u64_into_felt
-    
-    # => [result]
+#! (a * b) / divisor. The product must fit in a u128 and the quotient in a felt.
+const MD_DIVISOR = 0
+const MD_B = 1
+const MD_A = 2
+@locals(3)
+pub proc mul_div(divisor: felt, b: felt, a: felt) -> felt
+    # => [divisor, b, a]
+    loc_store.MD_DIVISOR
+    # => [b, a]
+    loc_store.MD_B
+    # => [a]
+    loc_store.MD_A
+    # => []
+    loc_load.MD_A exec.felt_to_u128
+    # => [a_u128]
+    loc_load.MD_B exec.felt_to_u128
+    # => [b_u128, a_u128]
+    exec.u128::overflowing_mul
+    # => [overflow, product]
+    eq.0 assert.err=ERR_OVERFLOW
+    # => [product]
+    loc_load.MD_DIVISOR exec.felt_to_u128
+    # => [divisor, product]
+    exec.u128::div
+    # => [quotient]
+    exec.safe_cast_u128_into_felt
+    # => [felt]
     exec.sys::truncate_stack
 end
 
-@locals(3)
-pub proc safe_cast_u64_into_felt(a: u64) -> felt
-    ### loc.0: a_hi 
-    ### loc.1: a_hi_scaled
-    ### loc.2: res
-    # => [a_hi, a_lo]
-    loc_store.0 loc_load.0
-    mul.U32_BOUND loc_store.1  
-    loc_load.1 loc_load.0 gte assert.err=ERR_OVERFLOW
-    # => [a_lo]
-    loc_load.1
-    # => [a_hi_scaled, a_lo]
-    add loc_store.2
-    ### if res < a_hi_scaled  => overflow
-    loc_load.2 loc_load.1 
-    # => [a_hi_scaled, res]
-    gte assert.err=ERR_OVERFLOW
-    loc_load.2
+#! Floor square root of a u128. The result always fits in a felt.
+const SQ_N = 0
+const SQ_RES = 4
+const SQ_BIT = 8
+const SQ_TMP = 12
+const SQ_LEFT = 16
+@locals(17)
+pub proc sqrt_u128(n: u128) -> felt
+    # => [n0, n1, n2, n3]
+    loc_storew_le.SQ_N dropw
+    # => []
+    padw loc_storew_le.SQ_RES dropw
+    # bit starts at 1 << 126. Last push is the top limb, so limb0 is 0.
+    push.0x40000000.0.0.0
+    # => [0, 0, 0, 0x40000000]
+    loc_storew_le.SQ_BIT dropw
+    # => []
+    push.64 loc_store.SQ_LEFT
+    push.1
+    # => [1]
+    while.true
+        # tmp = result + bit
+        padw loc_loadw_le.SQ_BIT
+        padw loc_loadw_le.SQ_RES
+        # => [result, bit]
+        exec.u128::wrapping_add
+        # => [tmp]
+        loc_storew_le.SQ_TMP dropw
+        # => []
+        # n >= tmp
+        padw loc_loadw_le.SQ_N
+        padw loc_loadw_le.SQ_TMP
+        # => [tmp, n]
+        exec.u128::gte
+        # => [n_ge_tmp]
+        if.true
+            padw loc_loadw_le.SQ_N
+            padw loc_loadw_le.SQ_TMP
+            # => [tmp, n]
+            exec.u128::wrapping_sub
+            # => [n - tmp]
+            loc_storew_le.SQ_N dropw
+            # result = (result >> 1) + bit
+            padw loc_loadw_le.SQ_RES
+            push.1
+            # => [1, result]
+            exec.u128::shr
+            # => [result >> 1]
+            padw loc_loadw_le.SQ_BIT
+            # => [bit, result >> 1]
+            exec.u128::wrapping_add
+            loc_storew_le.SQ_RES dropw
+        else
+            padw loc_loadw_le.SQ_RES
+            push.1
+            exec.u128::shr
+            loc_storew_le.SQ_RES dropw
+        end
+        # bit = bit >> 2
+        padw loc_loadw_le.SQ_BIT
+        push.2
+        exec.u128::shr
+        loc_storew_le.SQ_BIT dropw
+        loc_load.SQ_LEFT sub.1 loc_store.SQ_LEFT
+        loc_load.SQ_LEFT neq.0
+        # => [continue]
+    end
+    padw loc_loadw_le.SQ_RES
+    # => [result_u128]
+    exec.safe_cast_u128_into_felt
+    # => [felt]
 end
 
+#! Floor square root of a felt.
+pub proc sqrt(n: felt) -> felt
+    # => [felt]
+    push.0.0
+    # => [0, 0, felt]
+    movup.2
+    # => [felt, 0, 0]
+    u32split
+    # => [lo, hi, 0, 0]
+    exec.sqrt_u128
+    # => [felt]
+    exec.sys::truncate_stack
+end
+
+#! sqrt(a * b) for two felts. The product is the full 128-bit integer product.
+const SP_B = 0
+const SP_A = 1
+@locals(2)
+pub proc sqrt_of_product(b: felt, a: felt) -> felt
+    # => [b, a]
+    loc_store.SP_B
+    # => [a]
+    loc_store.SP_A
+    # => []
+    loc_load.SP_A exec.felt_to_u128
+    loc_load.SP_B exec.felt_to_u128
+    # => [b_u128, a_u128]
+    exec.u128::overflowing_mul
+    # => [overflow, product]
+    eq.0 assert.err=ERR_OVERFLOW
+    # => [product]
+    exec.sqrt_u128
+    # => [felt]
+    exec.sys::truncate_stack
+end
 
 
 @locals(2)

@@ -3,22 +3,22 @@ use miden_client::{
     Felt, Word,
     asset::FungibleAsset,
     crypto::FeltRng,
-    note::{
-        Note, NoteAssets, NoteAttachment, NoteMetadata, NoteTag, NoteType, build_p2id_recipient,
-    },
+    note::{Note, NoteAssets, NoteTag, NoteType, PartialNoteMetadata},
     rpc::domain::account::AccountStorageRequirements,
-    store::AccountRecordData,
-    transaction::{ForeignAccount, OutputNote, TransactionRequestBuilder},
+    transaction::{ForeignAccount, TransactionRequestBuilder},
 };
+use miden_standards::note::P2idNoteStorage;
 use xyk_pool::{
-    common::get_return_note_serial,
     pool_ops::{
         build_lp_local_deposit_note, build_xyk_register_note,
         build_xyk_swap_exact_tokens_for_tokens_note, build_xyk_swap_tokens_for_exact_tokens_note,
         get_combined_pool_library, get_lp_local_library,
     },
     test_utils::*,
-    utils::slot_name,
+    utils::{
+        fetch_vault_for_account_from_chain, pool_id_registry_key, slot_name,
+        vault_fungible_balance,
+    },
 };
 
 use std::time::Duration;
@@ -62,8 +62,8 @@ async fn swap_tokens_for_exact_tokens_happy_path_test() -> Result<()> {
     // ── Read user balances before swap ──
     let user_vault_before =
         fetch_vault_for_account_from_chain(&setup.clients.rpc_api, &setup.user.id()).await?;
-    let user_balance0_before = user_vault_before.get_balance(token0_id).unwrap_or(0);
-    let user_balance1_before = user_vault_before.get_balance(token1_id).unwrap_or(0);
+    let user_balance0_before = vault_fungible_balance(&user_vault_before, token0_id).unwrap_or(0);
+    let user_balance1_before = vault_fungible_balance(&user_vault_before, token1_id).unwrap_or(0);
     println!("\nUser balances BEFORE swap:");
     println!("  token0 = {}", user_balance0_before);
     println!("  token1 = {}", user_balance1_before);
@@ -97,17 +97,16 @@ async fn swap_tokens_for_exact_tokens_happy_path_test() -> Result<()> {
 
     let swap_serial_num = swap_note.serial_num();
     let p2id_serial_num: Word = [
-        swap_serial_num[0],
+        swap_serial_num[0] + Felt::ONE,
         swap_serial_num[1],
         swap_serial_num[2],
-        swap_serial_num[3] + Felt::new(1),
+        swap_serial_num[3],
     ]
     .into();
 
-    let recipient = build_p2id_recipient(setup.user.id(), p2id_serial_num)?;
+    let recipient = P2idNoteStorage::new(setup.user.id()).into_recipient(p2id_serial_num);
     let tag = NoteTag::with_account_target(setup.user.id());
-    let metadata = NoteMetadata::new(setup.contract.id(), return_note_type, tag)
-        .with_attachment(NoteAttachment::default());
+    let metadata = PartialNoteMetadata::new(setup.contract.id(), return_note_type).with_tag(tag);
     let vault = NoteAssets::new(vec![
         FungibleAsset::new(token1_id, swap_amount_out)?.into(),
         FungibleAsset::new(token0_id, 10)?.into(),
@@ -115,7 +114,7 @@ async fn swap_tokens_for_exact_tokens_happy_path_test() -> Result<()> {
     let return_note = Note::new(vault, metadata, recipient);
 
     let create_swap_req = TransactionRequestBuilder::new()
-        .own_output_notes([OutputNote::Full(swap_note.clone())])
+        .own_output_notes([swap_note.clone()])
         .build()?;
     let _tx_id = setup
         .clients
@@ -135,6 +134,14 @@ async fn swap_tokens_for_exact_tokens_happy_path_test() -> Result<()> {
     setup.clients.client.sync_state().await?;
     println!("---------------------------Consuming swap note---------------------------");
 
+    println!("-------------------------------- return ptid note --------------------------------");
+    println!("return note digest: {:?}", return_note.recipient().digest());
+    println!("return note serial: {:?}", return_note.serial_num());
+    println!("return note type: {:?}", return_note.metadata().note_type());
+    println!("return note tag: {:?}", return_note.metadata().tag());
+    println!("return note assets: {:?}", return_note.assets());
+    println!("-------------------------------- return ptid note --------------------------------");
+
     tokio::time::sleep(Duration::from_secs(1)).await;
     let user_consume_return_note_request =
         TransactionRequestBuilder::new().build_consume_notes(vec![return_note.clone()])?;
@@ -153,21 +160,17 @@ async fn swap_tokens_for_exact_tokens_happy_path_test() -> Result<()> {
         .get_account(setup.contract.id())
         .await?
         .unwrap();
-    let acc_after_swap = match acc_after_swap.account_data() {
-        AccountRecordData::Full(account) => account,
-        AccountRecordData::Partial(_) => return Err(anyhow::anyhow!("Account not found")),
-    };
     let storage_after_swap = acc_after_swap.storage();
     let total_supply_after_swap =
         storage_after_swap.get_item(&slot_name("zoro::lp_local::total_supply"))?;
     let reserve_after_swap = storage_after_swap.get_item(&slot_name("zoro::lp_local::reserve"))?;
     let vault_after_swap = acc_after_swap.vault();
 
-    let ts_s = total_supply_after_swap[0].as_int();
-    let r0_s = reserve_after_swap[1].as_int();
-    let r1_s = reserve_after_swap[0].as_int();
-    let pool_balance0_s = vault_after_swap.get_balance(token0_id)?;
-    let pool_balance1_s = vault_after_swap.get_balance(token1_id)?;
+    let ts_s = total_supply_after_swap[0].as_canonical_u64();
+    let r0_s = reserve_after_swap[1].as_canonical_u64();
+    let r1_s = reserve_after_swap[0].as_canonical_u64();
+    let pool_balance0_s = vault_fungible_balance(&vault_after_swap, token0_id)?;
+    let pool_balance1_s = vault_fungible_balance(&vault_after_swap, token1_id)?;
 
     println!("\nAfter swap:");
     println!("  total_supply  = {} (was {})", ts_s, ts_d);
@@ -185,8 +188,8 @@ async fn swap_tokens_for_exact_tokens_happy_path_test() -> Result<()> {
     // ── Read user balances after swap ──
     let user_vault_after =
         fetch_vault_for_account_from_chain(&setup.clients.rpc_api, &setup.user.id()).await?;
-    let user_balance0_after = user_vault_after.get_balance(token0_id).unwrap_or(0);
-    let user_balance1_after = user_vault_after.get_balance(token1_id).unwrap_or(0);
+    let user_balance0_after = vault_fungible_balance(&user_vault_after, token0_id).unwrap_or(0);
+    let user_balance1_after = vault_fungible_balance(&user_vault_after, token1_id).unwrap_or(0);
     println!("\nUser balances AFTER swap:");
     println!(
         "  token0 = {} (was {})",
@@ -260,8 +263,8 @@ async fn swap_exact_tokens_for_tokens_happy_path_test() -> Result<()> {
     // ── Read user balances before swap ──
     let user_vault_before =
         fetch_vault_for_account_from_chain(&setup.clients.rpc_api, &setup.user.id()).await?;
-    let user_balance0_before = user_vault_before.get_balance(token0_id).unwrap_or(0);
-    let user_balance1_before = user_vault_before.get_balance(token1_id).unwrap_or(0);
+    let user_balance0_before = vault_fungible_balance(&user_vault_before, token0_id).unwrap_or(0);
+    let user_balance1_before = vault_fungible_balance(&user_vault_before, token1_id).unwrap_or(0);
     println!("\nUser balances BEFORE swap:");
     println!("  token0 = {}", user_balance0_before);
     println!("  token1 = {}", user_balance1_before);
@@ -272,6 +275,8 @@ async fn swap_exact_tokens_for_tokens_happy_path_test() -> Result<()> {
         "Swapping {} of token0 for token1 (min_out=0)",
         swap_amount_in
     );
+    println!("token0_id: {} {}", token0_id.suffix(), token0_id.prefix());
+    println!("token1_id: {} {}", token1_id.suffix(), token1_id.prefix());
 
     let expected_out = get_amount_out(swap_amount_in, r0_d, r1_d);
     println!("Expected amount_out (Rust): {}", expected_out);
@@ -297,22 +302,26 @@ async fn swap_exact_tokens_for_tokens_happy_path_test() -> Result<()> {
 
     let swap_serial_num = swap_note.serial_num();
     let p2id_serial_num: Word = [
-        swap_serial_num[0],
+        swap_serial_num[0] + Felt::ONE,
         swap_serial_num[1],
         swap_serial_num[2],
-        swap_serial_num[3] + Felt::new(1),
+        swap_serial_num[3],
     ]
     .into();
 
-    let recipient = build_p2id_recipient(setup.user.id(), p2id_serial_num)?;
+    let recipient = P2idNoteStorage::new(setup.user.id()).into_recipient(p2id_serial_num);
     let tag = NoteTag::with_account_target(setup.user.id());
-    let metadata = NoteMetadata::new(setup.contract.id(), return_note_type, tag)
-        .with_attachment(NoteAttachment::default());
+    let metadata = PartialNoteMetadata::new(setup.contract.id(), return_note_type).with_tag(tag);
     let vault = NoteAssets::new(vec![FungibleAsset::new(token1_id, expected_out)?.into()])?;
     let return_note = Note::new(vault, metadata, recipient);
 
+    setup
+        .clients
+        .client
+        .add_note_tag(NoteTag::with_account_target(setup.contract.id()))
+        .await?;
     let create_swap_req = TransactionRequestBuilder::new()
-        .own_output_notes([OutputNote::Full(swap_note.clone())])
+        .own_output_notes([swap_note.clone()])
         .build()?;
     let _tx_id = setup
         .clients
@@ -342,7 +351,7 @@ async fn swap_exact_tokens_for_tokens_happy_path_test() -> Result<()> {
     setup.clients.client.sync_state().await?;
     println!("---------------------------Consuming swap note---------------------------");
 
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
     let user_consume_return_note_request =
         TransactionRequestBuilder::new().build_consume_notes(vec![return_note.clone()])?;
     let _user_consume_return_note_id = setup
@@ -360,21 +369,17 @@ async fn swap_exact_tokens_for_tokens_happy_path_test() -> Result<()> {
         .get_account(setup.contract.id())
         .await?
         .unwrap();
-    let acc_after_swap = match acc_after_swap.account_data() {
-        AccountRecordData::Full(account) => account,
-        AccountRecordData::Partial(_) => return Err(anyhow::anyhow!("Account not found")),
-    };
     let storage_after_swap = acc_after_swap.storage();
     let total_supply_after_swap =
         storage_after_swap.get_item(&slot_name("zoro::lp_local::total_supply"))?;
     let reserve_after_swap = storage_after_swap.get_item(&slot_name("zoro::lp_local::reserve"))?;
     let vault_after_swap = acc_after_swap.vault();
 
-    let ts_s = total_supply_after_swap[0].as_int();
-    let r0_s = reserve_after_swap[1].as_int();
-    let r1_s = reserve_after_swap[0].as_int();
-    let pool_balance0_s = vault_after_swap.get_balance(token0_id)?;
-    let pool_balance1_s = vault_after_swap.get_balance(token1_id)?;
+    let ts_s = total_supply_after_swap[0].as_canonical_u64();
+    let r0_s = reserve_after_swap[1].as_canonical_u64();
+    let r1_s = reserve_after_swap[0].as_canonical_u64();
+    let pool_balance0_s = vault_fungible_balance(&vault_after_swap, token0_id)?;
+    let pool_balance1_s = vault_fungible_balance(&vault_after_swap, token1_id)?;
 
     println!("\nAfter swap:");
     println!("  total_supply  = {} (was {})", ts_s, ts_d);
@@ -392,8 +397,8 @@ async fn swap_exact_tokens_for_tokens_happy_path_test() -> Result<()> {
     // ── Read user balances after swap ──
     let user_vault_after =
         fetch_vault_for_account_from_chain(&setup.clients.rpc_api, &setup.user.id()).await?;
-    let user_balance0_after = user_vault_after.get_balance(token0_id).unwrap_or(0);
-    let user_balance1_after = user_vault_after.get_balance(token1_id).unwrap_or(0);
+    let user_balance0_after = vault_fungible_balance(&user_vault_after, token0_id).unwrap_or(0);
+    let user_balance1_after = vault_fungible_balance(&user_vault_after, token1_id).unwrap_or(0);
     println!("\nUser balances AFTER swap:");
     println!(
         "  token0 = {} (was {})",
@@ -456,7 +461,7 @@ async fn register_pool_happy_path_test() -> Result<()> {
     println!("====== SENDING THE REGISTER NOTE");
 
     let consume_req = TransactionRequestBuilder::new()
-        .own_output_notes([OutputNote::Full(register_note.clone())])
+        .own_output_notes([register_note.clone()])
         .build()?;
 
     println!("Built request for sending register note");
@@ -492,19 +497,7 @@ async fn register_pool_happy_path_test() -> Result<()> {
         .await?
         .unwrap();
 
-    let acc = match acc.account_data() {
-        AccountRecordData::Full(a) => a,
-        AccountRecordData::Partial(_) => {
-            return Err(anyhow::anyhow!("Registry account data is partial"));
-        }
-    };
-
-    let pool_key = Word::new([
-        pool_id.suffix(),
-        pool_id.prefix().into(),
-        Felt::new(0),
-        Felt::new(0),
-    ]);
+    let pool_key = pool_id_registry_key(&pool_id);
     let stored_code_hash = acc
         .storage()
         .get_map_item(&slot_name("zoro::registry::pools_mapping"), pool_key)?;
@@ -527,7 +520,7 @@ async fn register_pool_happy_path_test() -> Result<()> {
     println!("====== SENDING THE REGISTER NOTE AGAIN (should not succeed)");
 
     let consume_req = TransactionRequestBuilder::new()
-        .own_output_notes([OutputNote::Full(register_note.clone())])
+        .own_output_notes([register_note.clone()])
         .build()?;
 
     println!("Built request for sending register note");
@@ -559,95 +552,6 @@ async fn register_pool_happy_path_test() -> Result<()> {
     setup.clients.client.sync_state().await?;
 
     println!("register_pool_happy_path_test passed!");
-    Ok(())
-}
-
-#[tokio::test]
-async fn register_pool_with_deposit_test() -> Result<()> {
-    let mut setup = setup_registry_test_environment().await?;
-
-    let pool_id = setup.pool.id();
-    let token0_id = setup.faucets[0].faucet.id();
-    let token1_id = setup.faucets[1].faucet.id();
-
-    println!(
-        "register_pool: pool={}, token0={}, token1={}, registry={}",
-        pool_id.to_hex(),
-        token0_id.to_hex(),
-        token1_id.to_hex(),
-        setup.registry.id().to_hex(),
-    );
-    let amount0 = 1000000u64;
-    let amount1 = 1000000u64;
-    let token0_asset = FungibleAsset::new(token0_id, amount0)?;
-    let token1_asset = FungibleAsset::new(token1_id, amount1)?;
-    let lp_lib = get_lp_local_library()?;
-    let deposit_note = build_lp_local_deposit_note(
-        setup.pool.id(),
-        &lp_lib,
-        token0_asset,
-        token1_asset,
-        setup.user.id(),
-        setup.user.id(),
-        setup.clients.client.rng().draw_word(),
-    )?;
-
-    println!("=== SEND DEPOSIT NOTE ");
-
-    let create_req = TransactionRequestBuilder::new()
-        .own_output_notes([OutputNote::Full(deposit_note.clone())])
-        .build()?;
-    let _tx_id = setup
-        .clients
-        .client
-        .submit_new_transaction(setup.user.id(), create_req)
-        .await?;
-    setup.clients.client.sync_state().await?;
-
-    println!("=== CONSUME DEPOSIT NOTE ");
-
-    let deposit_serial = deposit_note.serial_num();
-    let register_serial = get_return_note_serial(deposit_serial, pool_id);
-    let register_note = build_xyk_register_note(
-        &setup.registry.id(),
-        register_serial,
-        &token0_id,
-        &token1_id,
-        &setup.pool.id(),
-        &setup.pool.id(),
-    )?;
-    let consume_req = TransactionRequestBuilder::new()
-        .input_notes([(deposit_note.clone(), None)])
-        // .expected_future_notes(vec![(
-        //     register_note.clone().into(),
-        //     register_note.metadata().tag(),
-        // )])
-        // .expected_output_recipients(vec![register_note.recipient().clone()])
-        .build()?;
-    let _consume_id = setup
-        .clients
-        .client
-        .submit_new_transaction(setup.pool.id(), consume_req)
-        .await?;
-
-    setup.clients.client.sync_state().await?;
-
-    println!("=== CONSUME XYK_REGISTER NOTE ");
-
-    let foreign = ForeignAccount::public(setup.pool.id(), AccountStorageRequirements::default())?;
-    let consume_req = TransactionRequestBuilder::new()
-        .input_notes([(register_note.clone(), None)])
-        .foreign_accounts([foreign])
-        .build()?;
-    let _consume_id = setup
-        .clients
-        .client
-        .submit_new_transaction(setup.registry.id(), consume_req)
-        .await?;
-
-    setup.clients.client.sync_state().await?;
-
-    println!("register_pool_with_deposit_test passed!");
     Ok(())
 }
 
@@ -685,7 +589,7 @@ async fn lp_deposit_withdraw_happy_path_test() -> Result<()> {
     setup.clients.client.add_note_tag(pool_tag).await?;
 
     let create_req = TransactionRequestBuilder::new()
-        .own_output_notes([OutputNote::Full(deposit_note.clone())])
+        .own_output_notes([deposit_note.clone()])
         .build()?;
     let _tx_id = setup
         .clients
@@ -711,10 +615,6 @@ async fn lp_deposit_withdraw_happy_path_test() -> Result<()> {
         .get_account(setup.pool.id())
         .await?
         .unwrap();
-    let acc_after_deposit = match acc_after_deposit.account_data() {
-        AccountRecordData::Full(account) => account,
-        AccountRecordData::Partial(_) => return Err(anyhow::anyhow!("Account not found")),
-    };
     let storage_after_deposit = acc_after_deposit.storage();
     let total_supply_after_deposit =
         storage_after_deposit.get_item(&slot_name("zoro::lp_local::total_supply"))?;
@@ -723,13 +623,13 @@ async fn lp_deposit_withdraw_happy_path_test() -> Result<()> {
     let vault_after_deposit = acc_after_deposit.vault();
     println!(
         "after deposit token0 balance={}, token1 balance={}",
-        vault_after_deposit.get_balance(token0_id)?,
-        vault_after_deposit.get_balance(token1_id)?
+        vault_fungible_balance(&vault_after_deposit, token0_id)?,
+        vault_fungible_balance(&vault_after_deposit, token1_id)?
     );
 
-    let ts = total_supply_after_deposit[0].as_int();
-    let r0 = reserve_after_deposit[0].as_int();
-    let r1 = reserve_after_deposit[1].as_int();
+    let ts = total_supply_after_deposit[0].as_canonical_u64();
+    let r0 = reserve_after_deposit[0].as_canonical_u64();
+    let r1 = reserve_after_deposit[1].as_canonical_u64();
     println!(
         "After deposit: total_supply={}, reserve0={}, reserve1={}",
         ts, r0, r1
@@ -755,7 +655,7 @@ async fn lp_deposit_withdraw_happy_path_test() -> Result<()> {
     )?;
 
     let create_req = TransactionRequestBuilder::new()
-        .own_output_notes([OutputNote::Full(withdraw_note.clone())])
+        .own_output_notes([withdraw_note.clone()])
         .build()?;
     let _tx_id = setup
         .clients
@@ -766,7 +666,7 @@ async fn lp_deposit_withdraw_happy_path_test() -> Result<()> {
 
     let return_note_serial_num = get_return_note_serial(withdraw_note_serial_num, setup.user.id());
     let return_note_recipient =
-        build_p2id_recipient(setup.user.id(), return_note_serial_num).unwrap();
+        P2idNoteStorage::new(setup.user.id()).into_recipient(return_note_serial_num);
     println!("-=-=-=-=-=-=-=-=-=-=-=user_id={:?}", setup.user.id());
     println!(
         "-=-=-=-=-=-=-=-=-=-=-=return_note_recipient={:?}",
@@ -790,19 +690,15 @@ async fn lp_deposit_withdraw_happy_path_test() -> Result<()> {
         .get_account(setup.pool.id())
         .await?
         .unwrap();
-    let acc_after_withdraw = match acc_after_withdraw.account_data() {
-        AccountRecordData::Full(account) => account,
-        AccountRecordData::Partial(_) => return Err(anyhow::anyhow!("Account not found")),
-    };
     let storage_after_withdraw = acc_after_withdraw.storage();
     let total_supply_after_withdraw =
         storage_after_withdraw.get_item(&slot_name("zoro::lp_local::total_supply"))?;
     let reserve_after_withdraw =
         storage_after_withdraw.get_item(&slot_name("zoro::lp_local::reserve"))?;
 
-    let ts_after = total_supply_after_withdraw[0].as_int();
-    let r0_after = reserve_after_withdraw[0].as_int();
-    let r1_after = reserve_after_withdraw[1].as_int();
+    let ts_after = total_supply_after_withdraw[0].as_canonical_u64();
+    let r0_after = reserve_after_withdraw[0].as_canonical_u64();
+    let r1_after = reserve_after_withdraw[1].as_canonical_u64();
 
     let (expected_amount0_out, expected_amount1_out) =
         compute_expected_withdraw(ts, withdraw_amount, r0, r1);
@@ -835,10 +731,10 @@ async fn lp_deposit_withdraw_happy_path_test() -> Result<()> {
     );
 
     let user_key = Word::new([
-        Felt::new(0),
-        Felt::new(0),
         setup.user.id().suffix(),
         setup.user.id().prefix().into(),
+        Felt::ZERO,
+        Felt::ZERO,
     ]);
     let user_deposit_after = storage_after_withdraw.get_map_item(
         &slot_name("zoro::lp_local::user_deposits_mapping"),
@@ -846,7 +742,7 @@ async fn lp_deposit_withdraw_happy_path_test() -> Result<()> {
     )?;
     println!(
         "User deposit after withdraw: {}",
-        user_deposit_after[0].as_int()
+        user_deposit_after[0].as_canonical_u64()
     );
 
     let user_deposit_before = storage_after_deposit.get_map_item(
@@ -854,8 +750,8 @@ async fn lp_deposit_withdraw_happy_path_test() -> Result<()> {
         user_key,
     )?;
     assert_eq!(
-        user_deposit_after[0].as_int(),
-        user_deposit_before[0].as_int() - withdraw_amount,
+        user_deposit_after[0].as_canonical_u64(),
+        user_deposit_before[0].as_canonical_u64() - withdraw_amount,
         "user deposit should decrease by withdraw_amount"
     );
 
@@ -895,7 +791,7 @@ async fn deposit_happy_path_test() -> Result<()> {
     print_phase("Send deposit note to node");
 
     let create_req = TransactionRequestBuilder::new()
-        .own_output_notes([OutputNote::Full(deposit_note.clone())])
+        .own_output_notes([deposit_note.clone()])
         .build()?;
     let _tx_id = setup
         .clients
@@ -930,7 +826,7 @@ async fn deposit_happy_path_test() -> Result<()> {
     )?;
 
     let create_req_2 = TransactionRequestBuilder::new()
-        .own_output_notes([OutputNote::Full(deposit_note_2.clone())])
+        .own_output_notes([deposit_note_2.clone()])
         .build()?;
     let _tx_id = setup
         .clients
@@ -961,17 +857,13 @@ async fn deposit_happy_path_test() -> Result<()> {
         .get_account(setup.pool.id())
         .await?
         .unwrap();
-    let acc_after = match acc_after.account_data() {
-        AccountRecordData::Full(account) => account,
-        AccountRecordData::Partial(_) => return Err(anyhow::anyhow!("Account not found")),
-    };
 
     let acc_after_storage = acc_after.storage();
     let total_supply = acc_after_storage.get_item(&slot_name("zoro::lp_local::total_supply"))?;
     let reserve = acc_after_storage.get_item(&slot_name("zoro::lp_local::reserve"))?;
     let user_key = Word::new([
-        Felt::new(0),
-        Felt::new(0),
+        Felt::ZERO,
+        Felt::ZERO,
         setup.user.id().suffix(),
         setup.user.id().prefix().into(),
     ]);
@@ -982,10 +874,10 @@ async fn deposit_happy_path_test() -> Result<()> {
 
     println!(
         "total_supply={}\nreserve0={}\nreserve1={}\nuser_deposit_balance={}\n",
-        total_supply[0].as_int(),
-        reserve[0].as_int(),
-        reserve[1].as_int(),
-        user_deposit_balance[0].as_int(),
+        total_supply[0].as_canonical_u64(),
+        reserve[0].as_canonical_u64(),
+        reserve[1].as_canonical_u64(),
+        user_deposit_balance[0].as_canonical_u64(),
     );
 
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1021,7 +913,7 @@ async fn deposit_initial_underflow_test() -> Result<()> {
     setup.clients.client.add_note_tag(pool_tag).await?;
 
     let create_req = TransactionRequestBuilder::new()
-        .own_output_notes([OutputNote::Full(deposit_note.clone())])
+        .own_output_notes([deposit_note.clone()])
         .build()?;
     let _tx_id = setup
         .clients

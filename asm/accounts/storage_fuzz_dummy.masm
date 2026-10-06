@@ -12,7 +12,7 @@ const VALUE_SLOT = word("zoro::storage_fuzz_dummy::value_slot")
 const MAP_SLOT = word("zoro::storage_fuzz_dummy::map_slot")
 
 pub proc get_value() -> felt
-    push.VALUE_SLOT[0..2] exec.active_account::get_item drop drop drop
+    push.VALUE_SLOT[0..2] exec.active_account::get_item movdn.3 drop drop drop
     exec.sys::truncate_stack
 end
 
@@ -20,6 +20,6 @@ end
 #! Inputs: [KEY]
 #! Outputs: [value]
 pub proc get_value_from_map
-    push.MAP_SLOT[0..2] exec.active_account::get_map_item drop drop drop
+    push.MAP_SLOT[0..2] exec.active_account::get_map_item movdn.3 drop drop drop
     exec.sys::truncate_stack
 end

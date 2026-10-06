@@ -1,23 +1,24 @@
 use miden::protocol::active_note
 use zoro::lp_local
+use zoro::asset_utils
 use miden::core::sys
-
 
 const EXPECTED_NUM_ASSETS = 2
 const ERR_INVALID_NUM_ASSETS = "Invalid number of assets"
 
-
-begin
+@note_script
+pub proc main
     # Load assets from note (dest_ptr=0)
     push.0 exec.active_note::get_assets
-    # => [num_assets, 0]
-    swap drop
     # => [num_assets]
     push.EXPECTED_NUM_ASSETS eq assert.err=ERR_INVALID_NUM_ASSETS
     # => []
     exec.active_note::get_sender
     # => [sender_prefix, sender_suffix]
-    padw mem_loadw_be.0 padw mem_loadw_be.4
+    padw mem_loadw_le.4 padw mem_loadw_le.0
+    exec.asset_utils::compress_asset
+    padw mem_loadw_le.12 padw mem_loadw_le.8
+    exec.asset_utils::compress_asset
     # => [ASSET0, ASSET1, sender_prefix, sender_suffix]
     call.lp_local::deposit
     exec.sys::truncate_stack

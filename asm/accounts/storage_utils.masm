@@ -13,13 +13,13 @@ pub proc add_to_storage_item(slot_id_prefix: felt, slot_id_suffix: felt, increme
     loc_store.0 loc_store.1
     # => [increment_by]
     loc_load.1 loc_load.0 exec.active_account::get_item
-    drop drop drop
+    movdn.3 drop drop drop
     # => [current_value, increment_by]
     exec.math::safe_add
     # => [new_value]
     loc_store.2
     ### get current value
-    loc_load.2 push.0.0.0 
+    push.0.0.0 loc_load.2
     # => [NEW_VALUE]
     loc_load.1 loc_load.0 exec.native_account::set_item
     dropw
@@ -37,14 +37,14 @@ pub proc sub_from_storage_item(slot_id_prefix: felt, slot_id_suffix: felt, decre
     loc_store.0 loc_store.1
     # => [sub_by]
     loc_load.1 loc_load.0 exec.active_account::get_item
-    drop drop drop
+    movdn.3 drop drop drop
     # => [current_value, sub_by]
     swap
     exec.math::safe_sub
     # => [new_value]
     loc_store.2
     ### get current value
-    loc_load.2 push.0.0.0 
+    push.0.0.0 loc_load.2
     # => [NEW_VALUE]
     loc_load.1 loc_load.0 exec.native_account::set_item
     dropw
@@ -74,7 +74,7 @@ pub proc sub_from_map_item (slot_id_prefix: felt, slot_id_suffix: felt, key: wor
     loc_load.1 loc_load.0 
     # => [slot_id_prefix, slot_id_suffix, KEY]
     exec.active_account::get_map_item
-    drop drop drop
+    movdn.3 drop drop drop
     # => [old_value]
     loc_load.8
     # => [sub_by,old_value]
@@ -100,7 +100,7 @@ pub proc add_to_map_item #(slot_id_prefix: felt, slot_id_suffix: felt, key: Word
     loc_load.1 loc_load.0 
     # => [slot_id_prefix, slot_id_suffix, KEY]
     exec.active_account::get_map_item
-    drop drop drop
+    movdn.3 drop drop drop
     # => [old_value]
     loc_load.8
     # => [old_value]
@@ -123,7 +123,7 @@ pub proc set_map_item #(slot_id_prefix: felt, slot_id_suffix: felt, key: Word, v
     # loc.8: value
     loc_store.0 loc_store.1 loc_storew_be.4 dropw loc_store.8
     ### fill out value with 0 to full word
-    loc_load.8 push.0.0.0
+    push.0.0.0 loc_load.8
     ### load slot id and key
     padw loc_loadw_be.4 loc_load.1 loc_load.0
     exec.native_account::set_map_item 

@@ -5,10 +5,8 @@ use zoro::registry
 use miden::core::sys
 use miden::protocol::active_note
 
-
 const ERR_REGISTER_TARGET_ACCT_MISMATCH = "Register target account mismatch"
 const ERR_INVALID_NUM_INPUTS = "Invalid number of inputs"
-
 
 const EXPECTED_NUM_INPUTS = 8
 
@@ -22,36 +20,28 @@ const XYK_POOL_SUFFIX = 5
 const REGISTRY_PREFIX = 6
 const REGISTRY_SUFFIX = 7
 
-begin
-	push.0 drop
-	
-	push.INPUTS_START
-    exec.active_note::get_inputs
-
+@note_script
+pub proc main
+    push.INPUTS_START exec.active_note::get_storage
+    # => [num_storage_items]
     push.EXPECTED_NUM_INPUTS eq assert.err=ERR_INVALID_NUM_INPUTS
-    # => [dest_ptr]
-    drop
+    # => []
     exec.validate_consumer
 
-	mem_load.ASSET1_SUFFIX mem_load.ASSET1_PREFIX
-	mem_load.ASSET0_SUFFIX mem_load.ASSET0_PREFIX
+    mem_load.ASSET1_SUFFIX mem_load.ASSET1_PREFIX
+    mem_load.ASSET0_SUFFIX mem_load.ASSET0_PREFIX
     mem_load.XYK_POOL_SUFFIX mem_load.XYK_POOL_PREFIX
-	
     # => [xyk_pool_prefix, xyk_pool_suffix, asset0_prefix, asset0_suffix, asset1_prefix, asset1_suffix]
 
-	call.registry::register_pool
+    call.registry::register_pool
 
-	exec.sys::truncate_stack
+    exec.sys::truncate_stack
 end
-
-
 
 proc validate_consumer()
     exec.active_account::get_id
-    # => [consumer_prefix, consumer_suffix]
-    mem_load.REGISTRY_SUFFIX mem_load.REGISTRY_PREFIX
-    # => [registry_prefix, registry_suffix, consumer_prefix, consumer_suffix]
-   	exec.account_id::is_equal assert.err=ERR_REGISTER_TARGET_ACCT_MISMATCH
+    # => [consumer_suffix, consumer_prefix]
+    mem_load.REGISTRY_PREFIX mem_load.REGISTRY_SUFFIX
+    # => [registry_suffix, registry_prefix, consumer_suffix, consumer_prefix]
+    exec.account_id::is_equal assert.err=ERR_REGISTER_TARGET_ACCT_MISMATCH
 end
-
-

@@ -1,0 +1,7 @@
+# Pool account code commitments accepted by newly deployed registries.
+# Compute the current commitment with:
+# cargo run --release --bin pool_code_commitment
+accepted_pool_code_hashes = [
+  "0x79fe577ba9f2307255ae7ec99968ea7364b13a058876d9af0113a00f1cb09ab8",
+  "0x99b622ee4ccfc3077036ce2934a3945f964ebdc3ae2a877ec3264795f097c256",
+]

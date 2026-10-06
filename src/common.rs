@@ -2,27 +2,29 @@ use std::sync::Arc;
 use std::{fs, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
-use miden_client::auth::NoAuth;
-use miden_client::note::NoteTag;
+use miden_client::account::component::BasicWallet;
+use miden_client::account::{
+    Account, AccountBuilder, AccountBuilderSchemaCommitmentExt, AccountId, AccountType, StorageMap,
+    StorageSlot,
+};
+use miden_client::auth::{AuthSecretKey, NoAuth};
 use miden_client::{
     ClientError, Felt, Word,
-    account::{
-        Account, AccountBuilder, AccountId, AccountStorageMode, AccountType, StorageMap,
-        StorageSlot,
-    },
-    asset::{FungibleAsset, TokenSymbol},
-    auth::{AuthFalcon512Rpo, AuthSecretKey},
+    asset::{AssetAmount, FungibleAsset, TokenSymbol},
     builder::ClientBuilder,
     crypto::FeltRng,
-    keystore::FilesystemKeyStore,
+    keystore::{FilesystemKeyStore, Keystore},
     note::{Note, NoteError, NoteType},
     rpc::GrpcClient,
     store::TransactionFilter,
-    transaction::{OutputNote, TransactionRequestBuilder},
+    transaction::{TransactionRequestBuilder, notes_from_output},
 };
 use miden_client_sqlite_store::ClientBuilderSqliteExt;
-use miden_protocol::{FieldElement, account::AccountComponent, transaction::TransactionKernel};
-use miden_standards::account::{faucets::BasicFungibleFaucet, wallets::BasicWallet};
+use miden_protocol::account::StorageMapKey;
+use miden_standards::account::faucets::{FungibleFaucet, TokenName};
+use miden_standards::account::policies::{
+    BurnPolicyConfig, MintPolicyConfig, PolicyRegistration, TokenPolicyManager,
+};
 use rand::RngCore;
 use tracing::{debug, info, warn};
 
@@ -31,16 +33,17 @@ use serde::{Deserialize, Serialize};
 use crate::pool_ops::build_dummy_register_note;
 use crate::{
     pool_ops::{
-        get_combined_pool_library, get_lp_local_fuzz_dummy_library, get_lp_local_library,
-        get_pool_library, get_registry_library, get_storage_utils_library,
+        create_library, get_combined_pool_library, get_lp_local_fuzz_dummy_library,
+        get_lp_local_library, get_pool_library, get_registry_library, get_storage_utils_library,
+        kernel_assembler, shared_source_manager,
     },
     utils::{
-        create_library, extract_full_account, fetch_vault_for_account_from_chain,
-        get_register_note_root_hash, slot_name,
+        auth_single_sig_component, fetch_vault_for_account_from_chain, get_register_note_root_hash,
+        slot_name, zoro_component,
     },
 };
 
-use miden_client::{Client, rpc::Endpoint};
+use miden_client::{Client, note::NoteTag, rpc::Endpoint};
 pub type MidenClient = Client<FilesystemKeyStore>;
 pub struct MidenClients {
     pub client: MidenClient,
@@ -60,11 +63,17 @@ pub async fn instantiate_simple_client(
         .into();
     println!("\nConnecting to endpoint: {}", endpoint);
 
+    // Share our source manager with the client so that error codes raised by the
+    // TransactionExecutor (and anywhere else inside the client) can be resolved back to the
+    // original MASM source spans/messages, instead of only showing a plain numeric error code.
+    // Without this, the client falls back to its own empty `DefaultSourceManager`, which has no
+    // knowledge of the modules/libraries we assembled ourselves via `kernel_assembler()`.
     let mut client = ClientBuilder::new()
         .rpc(rpc_api.clone())
         .authenticator(keystore)
         .in_debug_mode(true.into())
         .sqlite_store(store_path.into())
+        .source_manager(shared_source_manager())
         .build()
         .await?;
 
@@ -93,15 +102,14 @@ pub async fn create_basic_account(
 ) -> Result<(Account, AuthSecretKey), ClientError> {
     let mut init_seed = [0_u8; 32];
     client.rng().fill_bytes(&mut init_seed);
-    let key_pair = AuthSecretKey::new_falcon512_rpo_with_rng(client.rng());
+    let key_pair = AuthSecretKey::new_falcon512_poseidon2_with_rng(client.rng());
     let builder = AccountBuilder::new(init_seed)
-        .account_type(AccountType::RegularAccountUpdatableCode)
-        .storage_mode(AccountStorageMode::Public)
-        .with_auth_component(AuthFalcon512Rpo::new(key_pair.public_key().to_commitment()))
+        .account_type(AccountType::Public)
+        .with_auth_component(auth_single_sig_component(&key_pair))
         .with_component(BasicWallet);
-    let account = builder.build().unwrap();
+    let account = builder.build_with_schema_commitment()?;
     client.add_account(&account, false).await?;
-    keystore.add_key(&key_pair).unwrap();
+    keystore.add_key(&key_pair, account.id()).await.unwrap();
     client.sync_state().await?;
 
     // dummy tx to get the new account into node
@@ -146,26 +154,28 @@ pub async fn deploy_xyk_pool(
     //     .map_err(|e| anyhow!("Failed to create pool library: {e:?}"))
     //     .unwrap();
     let xyk_pool_library = get_pool_library().unwrap();
-    let xyk_pool_component =
-        AccountComponent::new(xyk_pool_library, vec![reserves, assets_mapping])?
-            .with_supports_all_types();
+    let xyk_pool_component = zoro_component(
+        xyk_pool_library,
+        vec![reserves, assets_mapping],
+        "zoro::xyk_pool",
+    )
+    .map_err(|e| ClientError::AccountError(e))?;
 
     let mut init_seed = [0_u8; 32];
     client.rng().fill_bytes(&mut init_seed);
 
-    let key_pair = AuthSecretKey::new_falcon512_rpo_with_rng(client.rng());
+    let key_pair = AuthSecretKey::new_falcon512_poseidon2_with_rng(client.rng());
 
     let xyk_pool_contract = AccountBuilder::new(init_seed)
-        .account_type(AccountType::RegularAccountUpdatableCode)
-        .storage_mode(AccountStorageMode::Public)
+        .account_type(AccountType::Public)
         .with_component(xyk_pool_component.clone())
-        .with_auth_component(AuthFalcon512Rpo::new(key_pair.public_key().to_commitment()))
+        .with_auth_component(auth_single_sig_component(&key_pair))
         .with_component(BasicWallet)
-        .build()?;
+        .build_with_schema_commitment()?;
 
     println!(
         "pool contract commitment hash: {:?}",
-        xyk_pool_contract.commitment().to_hex()
+        xyk_pool_contract.to_commitment().to_hex()
     );
     println!(
         "pool config: token0={}, token1={}",
@@ -173,7 +183,10 @@ pub async fn deploy_xyk_pool(
         token1_id.to_hex(),
     );
 
-    keystore.add_key(&key_pair).unwrap();
+    keystore
+        .add_key(&key_pair, xyk_pool_contract.id())
+        .await
+        .unwrap();
     client
         .add_account(&xyk_pool_contract.clone(), false)
         .await?;
@@ -201,7 +214,7 @@ pub async fn deploy_lp_local_pool(
 
     let mut assets_mapping = StorageMap::new();
     assets_mapping.insert(
-        Word::default(),
+        StorageMapKey::new(Word::default()),
         [
             token1_id.suffix(),
             token1_id.prefix().as_felt(),
@@ -217,8 +230,8 @@ pub async fn deploy_lp_local_pool(
         StorageSlot::with_empty_value(slot_name("zoro::lp_local::total_supply"));
     let mut user_deposits_mapping = StorageMap::new();
     user_deposits_mapping.insert(
-        Word::new([Felt::new(0), Felt::new(0), Felt::new(0), Felt::new(1)]),
-        Word::new([Felt::new(0), Felt::new(0), Felt::new(0), Felt::new(1)]),
+        StorageMapKey::new(Word::new([Felt::ZERO, Felt::ZERO, Felt::ZERO, Felt::ONE])),
+        Word::new([Felt::ZERO, Felt::ZERO, Felt::ZERO, Felt::ONE]),
     )?;
     let user_deposits_slot = StorageSlot::with_map(
         slot_name("zoro::lp_local::user_deposits_mapping"),
@@ -228,7 +241,7 @@ pub async fn deploy_lp_local_pool(
     let register_note_root =
         StorageSlot::with_empty_value(slot_name("zoro::lp_local::register_note_root"));
 
-    let lp_local_component = AccountComponent::new(
+    let lp_local_component = zoro_component(
         lp_local_library,
         vec![
             assets_mapping_slot,
@@ -238,25 +251,27 @@ pub async fn deploy_lp_local_pool(
             registry_id_slot,
             register_note_root,
         ],
+        "zoro::lp_local",
     )
-    .map_err(|e| ClientError::NoteError(NoteError::other(e.to_string())))?
-    .with_supports_all_types();
+    .map_err(|e| ClientError::AccountError(e))?;
 
     let mut init_seed = [0_u8; 32];
     client.rng().fill_bytes(&mut init_seed);
-    let key_pair = AuthSecretKey::new_falcon512_rpo_with_rng(client.rng());
+    let key_pair = AuthSecretKey::new_falcon512_poseidon2_with_rng(client.rng());
 
     let lp_local_contract = AccountBuilder::new(init_seed)
-        .account_type(AccountType::RegularAccountUpdatableCode)
-        .storage_mode(AccountStorageMode::Public)
+        .account_type(AccountType::Public)
         .with_component(lp_local_component)
-        .with_auth_component(AuthFalcon512Rpo::new(key_pair.public_key().to_commitment()))
+        .with_auth_component(auth_single_sig_component(&key_pair))
         .with_component(BasicWallet)
-        .build()
+        .build_with_schema_commitment()
         .map_err(|e| anyhow!("Failed to build lp_local contract: {e:?}"))
         .unwrap();
 
-    keystore.add_key(&key_pair).unwrap();
+    keystore
+        .add_key(&key_pair, lp_local_contract.id())
+        .await
+        .map_err(|e| anyhow!("keystore: {e}"))?;
     client
         .add_account(&lp_local_contract.clone(), false)
         .await?;
@@ -279,7 +294,7 @@ pub async fn deploy_lp_local_pool(
 ///   - `user_deposits_mapping`: map slot
 pub async fn deploy_combined_pool(
     client: &mut MidenClient,
-    keystore: FilesystemKeyStore,
+    _keystore: FilesystemKeyStore,
     token0_id: &AccountId,
     token1_id: &AccountId,
     registry_id: &AccountId,
@@ -292,7 +307,7 @@ pub async fn deploy_combined_pool(
     // lp_local storage slots
     let mut assets_mapping = StorageMap::new();
     assets_mapping.insert(
-        Word::default(),
+        StorageMapKey::new(Word::default()),
         [
             token1_id.suffix(),
             token1_id.prefix().as_felt(),
@@ -330,15 +345,15 @@ pub async fn deploy_combined_pool(
     );
     let mut user_deposits_mapping = StorageMap::new();
     user_deposits_mapping.insert(
-        Word::new([Felt::new(0), Felt::new(0), Felt::new(0), Felt::new(1)]),
-        Word::new([Felt::new(0), Felt::new(0), Felt::new(0), Felt::new(1)]),
+        StorageMapKey::new(Word::new([Felt::ZERO, Felt::ZERO, Felt::ZERO, Felt::ONE])),
+        Word::new([Felt::ZERO, Felt::ZERO, Felt::ZERO, Felt::ONE]),
     )?;
     let user_deposits_slot = StorageSlot::with_map(
         slot_name("zoro::lp_local::user_deposits_mapping"),
         user_deposits_mapping,
     );
 
-    let lp_local_component = AccountComponent::new(
+    let lp_local_component = zoro_component(
         lp_local_library,
         vec![
             assets_mapping_slot,
@@ -348,26 +363,24 @@ pub async fn deploy_combined_pool(
             registry_id_slot,
             register_note_root,
         ],
+        "zoro::lp_local",
     )
-    .map_err(|e| ClientError::NoteError(NoteError::other(e.to_string())))?
-    .with_supports_all_types();
+    .map_err(|e| ClientError::AccountError(e))?;
 
-    let xyk_pool_component = AccountComponent::new(xyk_pool_library, vec![])
-        .map_err(|e| ClientError::NoteError(NoteError::other(e.to_string())))?
-        .with_supports_all_types();
+    let xyk_pool_component = zoro_component(xyk_pool_library, vec![], "zoro::xyk_pool")
+        .map_err(|e| ClientError::NoteError(NoteError::other(e.to_string())))?;
 
     let mut init_seed = [0_u8; 32];
     client.rng().fill_bytes(&mut init_seed);
-    let key_pair = AuthSecretKey::new_falcon512_rpo_with_rng(client.rng());
+    let key_pair = AuthSecretKey::new_falcon512_poseidon2_with_rng(client.rng());
 
     let contract = AccountBuilder::new(init_seed)
-        .account_type(AccountType::RegularAccountImmutableCode)
-        .storage_mode(AccountStorageMode::Public)
+        .account_type(AccountType::Public)
         .with_component(lp_local_component)
         .with_component(xyk_pool_component)
         .with_auth_component(NoAuth)
         .with_component(BasicWallet)
-        .build()
+        .build() //_with_schema_commitment()
         .map_err(|e| anyhow!("Failed to build combined pool contract: {e:?}"))
         .unwrap();
 
@@ -376,7 +389,7 @@ pub async fn deploy_combined_pool(
         contract.id().to_hex()
     );
 
-    // keystore.add_key(&key_pair).unwrap();
+    // keystore.add_key(&key_pair, contract.id()).await?;
     client.add_account(&contract.clone(), true).await?;
     client.sync_state().await?;
 
@@ -406,8 +419,8 @@ pub async fn deploy_lp_local_fuzz_dummy(
         StorageSlot::with_empty_map(slot_name("zoro::lp_local::assets_mapping"));
     let mut user_deposits_mapping = StorageMap::new();
     user_deposits_mapping.insert(
-        Word::new([Felt::new(0), Felt::new(0), Felt::new(0), Felt::new(1)]),
-        Word::new([Felt::new(0), Felt::new(0), Felt::new(0), Felt::new(1)]),
+        StorageMapKey::new(Word::new([Felt::ZERO, Felt::ZERO, Felt::ZERO, Felt::ONE])),
+        Word::new([Felt::ZERO, Felt::ZERO, Felt::ZERO, Felt::ONE]),
     )?;
     let user_deposits_slot = StorageSlot::with_map(
         slot_name("zoro::lp_local::user_deposits_mapping"),
@@ -417,7 +430,7 @@ pub async fn deploy_lp_local_fuzz_dummy(
     let register_note_root =
         StorageSlot::with_empty_value(slot_name("zoro::lp_local::register_note_root"));
 
-    let component = AccountComponent::new(
+    let component = zoro_component(
         lp_local_fuzz_dummy_library,
         vec![
             assets_mapping_slot,
@@ -427,23 +440,22 @@ pub async fn deploy_lp_local_fuzz_dummy(
             registry_id_slot,
             register_note_root,
         ],
+        "zoro::lp_local",
     )
-    .map_err(|e| ClientError::NoteError(NoteError::other(e.to_string())))?
-    .with_supports_all_types();
+    .map_err(|e| ClientError::AccountError(e))?;
 
     let mut init_seed = [0_u8; 32];
     client.rng().fill_bytes(&mut init_seed);
-    let key_pair = AuthSecretKey::new_falcon512_rpo_with_rng(client.rng());
+    let key_pair = AuthSecretKey::new_falcon512_poseidon2_with_rng(client.rng());
 
     let contract = AccountBuilder::new(init_seed)
-        .account_type(AccountType::RegularAccountUpdatableCode)
-        .storage_mode(AccountStorageMode::Public)
+        .account_type(AccountType::Public)
         .with_component(component)
-        .with_auth_component(AuthFalcon512Rpo::new(key_pair.public_key().to_commitment()))
+        .with_auth_component(auth_single_sig_component(&key_pair))
         .with_component(BasicWallet)
-        .build()?;
+        .build_with_schema_commitment()?;
 
-    keystore.add_key(&key_pair).unwrap();
+    keystore.add_key(&key_pair, contract.id()).await.unwrap();
     client.add_account(&contract.clone(), false).await?;
     client.sync_state().await?;
     Ok((contract, key_pair))
@@ -471,46 +483,52 @@ pub async fn deploy_storage_fuzz_dummy(
         .unwrap_or_else(|e| panic!("Failed to get storage_utils library: {e:?}"));
     // let math_library =
     //     get_math_library().unwrap_or_else(|e| panic!("Failed to get math library: {e:?}"));
-    let assembler = TransactionKernel::assembler()
+    let static_libs = [storage_utils_library.clone()];
+    let assembler = kernel_assembler()
         .with_warnings_as_errors(true)
         .with_static_library(storage_utils_library)
         .unwrap_or_else(|e| panic!("Failed to add math library: {e:?}"));
 
-    let dummy_library = create_library(assembler.clone(), "zoro::storage_fuzz_dummy", &dummy_code)
-        .unwrap_or_else(|e| panic!("Failed to create storage_fuzz_dummy library: {e:?}"));
+    let dummy_library = create_library(
+        assembler.clone(),
+        "zoro::storage_fuzz_dummy",
+        &dummy_code,
+        &static_libs,
+    )
+    .unwrap_or_else(|e| panic!("Failed to create storage_fuzz_dummy library: {e:?}"));
 
     let value_slot = StorageSlot::with_value(
         slot_name("zoro::storage_fuzz_dummy::value_slot"),
         Word::new([
-            Felt::new(initial_value),
-            Felt::new(0),
-            Felt::new(0),
-            Felt::new(0),
+            Felt::new_unchecked(initial_value),
+            Felt::ZERO,
+            Felt::ZERO,
+            Felt::ZERO,
         ]),
     );
 
-    let key = Word::new([Felt::new(0), Felt::new(0), Felt::new(0), Felt::new(0)]);
+    let key = Word::new([Felt::ZERO, Felt::ZERO, Felt::ZERO, Felt::ZERO]);
     let val = Word::new([
-        Felt::new(initial_map_value),
-        Felt::new(0),
-        Felt::new(0),
-        Felt::new(0),
+        Felt::new_unchecked(initial_map_value),
+        Felt::ZERO,
+        Felt::ZERO,
+        Felt::ZERO,
     ]);
     let mut mapping_instance = StorageMap::new();
-    mapping_instance.insert(key, val)?;
+    mapping_instance.insert(StorageMapKey::new(key), val)?;
     let map_slot = StorageSlot::with_map(
         slot_name("zoro::storage_fuzz_dummy::map_slot"),
         mapping_instance,
     );
     let lp_total_supply_slot = StorageSlot::with_value(
         slot_name("zoro::storage_fuzz_dummy::lp_total_supply"),
-        Word::new([Felt::new(0), Felt::new(0), Felt::new(0), Felt::new(0)]),
+        Word::new([Felt::ZERO, Felt::ZERO, Felt::ZERO, Felt::ZERO]),
     );
     let lp_user_deposits_mapping = StorageSlot::with_empty_map(slot_name(
         "zoro::storage_fuzz_dummy::lp_user_deposits_mapping",
     ));
 
-    let dummy_component = AccountComponent::new(
+    let dummy_component = zoro_component(
         dummy_library,
         vec![
             value_slot,
@@ -518,22 +536,24 @@ pub async fn deploy_storage_fuzz_dummy(
             lp_total_supply_slot,
             lp_user_deposits_mapping,
         ],
-    )?
-    .with_supports_all_types();
+        "zoro::storage_fuzz_dummy",
+    )?;
 
     let mut init_seed = [0_u8; 32];
     client.rng().fill_bytes(&mut init_seed);
-    let key_pair = AuthSecretKey::new_falcon512_rpo_with_rng(client.rng());
+    let key_pair = AuthSecretKey::new_falcon512_poseidon2_with_rng(client.rng());
 
     let dummy_contract = AccountBuilder::new(init_seed)
-        .account_type(AccountType::RegularAccountUpdatableCode)
-        .storage_mode(AccountStorageMode::Public)
+        .account_type(AccountType::Public)
         .with_component(dummy_component)
-        .with_auth_component(AuthFalcon512Rpo::new(key_pair.public_key().to_commitment()))
+        .with_auth_component(auth_single_sig_component(&key_pair))
         .with_component(BasicWallet)
-        .build()?;
+        .build_with_schema_commitment()?;
 
-    keystore.add_key(&key_pair).unwrap();
+    keystore
+        .add_key(&key_pair, dummy_contract.id())
+        .await
+        .unwrap();
     client.add_account(&dummy_contract.clone(), false).await?;
     client.sync_state().await?;
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -541,28 +561,29 @@ pub async fn deploy_storage_fuzz_dummy(
     Ok((dummy_contract, key_pair))
 }
 
-/// Deploys a registry account pre-seeded with an accepted pool code hash.
+/// Deploys a registry account pre-seeded with accepted pool code hashes.
 ///
 /// Storage slots (must match constants in registry.masm):
-///   - `accepted_code_hashes_mapping`: map with pool_code_hash → [1, 0, 0, 0]
+///   - `accepted_code_hashes_mapping`: map with each pool_code_hash → [1, 0, 0, 0]
 ///   - `pools_mapping`: empty map
 ///   - `assets_to_pool_mapping`: empty map
 pub async fn deploy_registry(
     client: &mut MidenClient,
     keystore: FilesystemKeyStore,
-    accepted_pool_code_hash: Word,
+    accepted_pool_code_hashes: &[Word],
 ) -> Result<(Account, AuthSecretKey), ClientError> {
     let registry_library = get_registry_library()
         .map_err(|e| ClientError::NoteError(NoteError::other(e.to_string())))?;
 
     let mut accepted_hashes_map = StorageMap::new();
 
-    println!("account pool code hash {:?}", accepted_pool_code_hash);
-
-    accepted_hashes_map.insert(
-        accepted_pool_code_hash,
-        Word::new([Felt::new(1), Felt::new(0), Felt::new(0), Felt::new(0)]),
-    )?;
+    for code_hash in accepted_pool_code_hashes {
+        println!("Accepted pool code hash: {code_hash:?}");
+        accepted_hashes_map.insert(
+            StorageMapKey::new(*code_hash),
+            Word::new([Felt::ONE, Felt::ZERO, Felt::ZERO, Felt::ZERO]),
+        )?;
+    }
     let accepted_hashes_slot = StorageSlot::with_map(
         slot_name("zoro::registry::accepted_code_hashes_mapping"),
         accepted_hashes_map,
@@ -574,39 +595,38 @@ pub async fn deploy_registry(
     let assets_to_pool_mapping_slot =
         StorageSlot::with_empty_map(slot_name("zoro::registry::assets_to_pool_mapping"));
 
-    let registry_component = AccountComponent::new(
+    let registry_component = zoro_component(
         registry_library,
         vec![
             pools_mapping_slot,
             assets_to_pool_mapping_slot,
             accepted_hashes_slot,
         ],
+        "zoro::registry",
     )
-    .map_err(|e| ClientError::NoteError(NoteError::other(e.to_string())))?
-    .with_supports_all_types();
+    .map_err(|e| ClientError::AccountError(e))?;
 
     let mut init_seed = [0_u8; 32];
     client.rng().fill_bytes(&mut init_seed);
-    let key_pair = AuthSecretKey::new_falcon512_rpo_with_rng(client.rng());
+    let key_pair = AuthSecretKey::new_falcon512_poseidon2_with_rng(client.rng());
 
     let registry = AccountBuilder::new(init_seed)
-        .account_type(AccountType::RegularAccountImmutableCode)
-        .storage_mode(AccountStorageMode::Public)
+        .account_type(AccountType::Public)
         .with_component(registry_component)
-        // .with_auth_component(AuthFalcon512Rpo::new(key_pair.public_key().to_commitment()))
+        // .with_auth_component(auth_single_sig_component(&key_pair))
         .with_auth_component(NoAuth)
         .with_component(BasicWallet)
-        .build()
+        .build_with_schema_commitment()
         .map_err(|e| anyhow!("Failed to build registry contract: {e:?}"))
         .unwrap();
 
     println!(
-        "Registry deployed => ID: {:?}, accepted code hash: {:?}",
+        "Registry deployed => ID: {}, accepted code hashes: {}",
         registry.id().to_hex(),
-        accepted_pool_code_hash,
+        accepted_pool_code_hashes.len(),
     );
 
-    keystore.add_key(&key_pair).unwrap();
+    keystore.add_key(&key_pair, registry.id()).await.unwrap();
     client.add_account(&registry, true).await?;
     client.sync_state().await?;
 
@@ -616,7 +636,7 @@ pub async fn deploy_registry(
 
     let dummy_register = build_dummy_register_note(&registry.id(), client.rng().draw_word());
     let init_note_tx = TransactionRequestBuilder::new()
-        .own_output_notes([OutputNote::Full(dummy_register)])
+        .own_output_notes([dummy_register])
         .build()?;
 
     println!("Dummy register note BUILT ");
@@ -701,12 +721,11 @@ pub fn load_test_state(path: &PathBuf) -> Option<CachedTestState> {
 pub async fn try_import_account(clients: &mut MidenClients, id: AccountId) -> Result<Account> {
     clients.client.import_account_by_id(id.clone()).await?;
 
-    let record = clients
+    let account = clients
         .client
         .get_account(id)
         .await?
         .ok_or(anyhow!("No account found on chain for account_id {}", id))?;
-    let account = extract_full_account(record.account_data())?.clone();
 
     Ok(account)
 }
@@ -722,28 +741,38 @@ pub async fn deploy_simple_faucet(
 ) -> Result<Account> {
     let symbol =
         TokenSymbol::new(symbol).map_err(|e| anyhow!("Failed to create token symbol: {e:?}"))?;
-    let max_supply = Felt::new(max_supply);
+    let name = TokenName::new(&symbol.to_string())
+        .map_err(|e| anyhow!("Failed to create token name: {e:?}"))?;
 
-    let key_pair = AuthSecretKey::new_falcon512_rpo_with_rng(client.rng());
+    let key_pair = AuthSecretKey::new_falcon512_poseidon2_with_rng(client.rng());
     let mut init_seed = [0u8; 32];
     client.rng().fill_bytes(&mut init_seed);
 
-    let builder = AccountBuilder::new(init_seed)
-        .account_type(AccountType::FungibleFaucet)
-        .storage_mode(AccountStorageMode::Public)
-        .with_auth_component(AuthFalcon512Rpo::new(key_pair.public_key().to_commitment()))
-        .with_component(
-            BasicFungibleFaucet::new(symbol, decimals, max_supply)
-                .map_err(|e| anyhow!("Failed to create BasicFungibleFaucet: {e:?}"))?,
-        );
+    let faucet = FungibleFaucet::builder()
+        .name(name)
+        .symbol(symbol)
+        .decimals(decimals)
+        .max_supply(AssetAmount::new(max_supply)?)
+        .build()
+        .map_err(|e| anyhow!("Failed to build fungible faucet component: {e:?}"))?;
+    let policy_manager = TokenPolicyManager::new()
+        .with_mint_policy(MintPolicyConfig::AllowAll, PolicyRegistration::Active)
+        .map_err(|e| anyhow!("Failed to configure mint policy: {e:?}"))?
+        .with_burn_policy(BurnPolicyConfig::AllowAll, PolicyRegistration::Active)
+        .map_err(|e| anyhow!("Failed to configure burn policy: {e:?}"))?;
 
-    let faucet_account = builder
+    let faucet_account = AccountBuilder::new(init_seed)
+        .account_type(AccountType::Public)
+        .with_auth_component(auth_single_sig_component(&key_pair))
+        .with_component(faucet)
+        .with_components(policy_manager)
         .build()
         .map_err(|e| anyhow!("Failed to build faucet account: {e:?}"))?;
 
     client.add_account(&faucet_account, true).await?;
     keystore
-        .add_key(&key_pair)
+        .add_key(&key_pair, faucet_account.id())
+        .await
         .map_err(|e| anyhow!("Failed to add key to keystore: {e:?}"))?;
 
     client.sync_state().await?;
@@ -770,6 +799,7 @@ pub async fn deploy_simple_faucets_from_config(
     let faucet_config: FaucetsConfig = toml::from_str(&faucet_config)?;
 
     let mut accounts = Vec::with_capacity(faucet_config.faucets.len());
+    println!("faucet_config.faucets: {:?}", faucet_config.faucets);
     for faucet in faucet_config.faucets {
         println!("Deploying faucet {}.", faucet.symbol);
         let account = deploy_simple_faucet(
@@ -831,17 +861,16 @@ pub async fn fund_wallet(
         .pop()
         .with_context(|| "failed to find transaction {tx_id:?} after submission")
         .unwrap();
-    let minted_note = match transaction.details.output_notes.get_note(0) {
-        OutputNote::Full(n) => n.clone(),
-        _ => panic!("Expected OutputNote::Full, got something else"),
-    };
+    let minted_note = notes_from_output(&transaction.details.output_notes)
+        .next()
+        .cloned()
+        .with_context(|| format!("failed to find full output note for transaction {tx_id:?}"))?;
 
     wait_for_note(client, &minted_note).await?;
 
     let consume_req = TransactionRequestBuilder::new()
-        .input_notes([(minted_note, None)])
-        .build()
-        .unwrap();
+        .input_notes([(minted_note.clone(), None)])
+        .build()?;
 
     let _tx_id = client
         .submit_new_transaction(account.id(), consume_req)
@@ -864,7 +893,7 @@ pub async fn wait_for_note(client: &mut MidenClient, expected: &Note) -> Result<
     loop {
         client.sync_state().await?;
         let notes = client.get_consumable_notes(None).await?;
-        let found = notes.iter().any(|(rec, _)| rec.id() == expected.id());
+        let found = notes.iter().any(|(rec, _)| rec.id() == Some(expected.id()));
         if found {
             info!("Note found {}", expected.id().to_hex());
             break;
@@ -875,9 +904,9 @@ pub async fn wait_for_note(client: &mut MidenClient, expected: &Note) -> Result<
     Ok(())
 }
 
-pub fn get_return_note_serial(input_note_serial: Word, user_id: AccountId) -> Word {
+pub fn get_return_note_serial(input_note_serial: Word, _user_id: AccountId) -> Word {
     let mut serial = Word::new([
-        input_note_serial[3] + Felt::new(1),
+        input_note_serial[3] + Felt::ONE,
         input_note_serial[2],
         input_note_serial[1],
         input_note_serial[0],

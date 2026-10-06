@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, time::Duration};
+use std::{collections::BTreeMap, time::Duration};
 
 use anyhow::Result;
 use miden_client::transaction::{AdviceInputs, TransactionRequestBuilder};
@@ -48,11 +48,11 @@ async fn add_to_storage_item_fuzz_test() -> Result<()> {
                 setup.contract.id(),
                 script.clone(),
                 AdviceInputs::default(),
-                BTreeSet::new(),
+                BTreeMap::new(),
             )
             .await?;
 
-        let got = stack[0].as_int();
+        let got = stack[0].as_canonical_u64();
         accumulated = accumulated.saturating_add(inc);
         let expected = accumulated;
 
@@ -162,11 +162,11 @@ async fn add_sub_storage_item_fuzz_test() -> Result<()> {
                 setup.contract.id(),
                 script.clone(),
                 AdviceInputs::default(),
-                BTreeSet::new(),
+                BTreeMap::new(),
             )
             .await?;
 
-        let got = stack[0].as_int();
+        let got = stack[0].as_canonical_u64();
 
         println!(
             "[{}/{}] {} {} => got={}, expected={}",
@@ -252,11 +252,11 @@ async fn add_to_map_item_fuzz_test() -> Result<()> {
                 setup.contract.id(),
                 add_script.clone(),
                 AdviceInputs::default(),
-                BTreeSet::new(),
+                BTreeMap::new(),
             )
             .await?;
 
-        let got = stack[0].as_int();
+        let got = stack[0].as_canonical_u64();
         accumulated = accumulated.saturating_add(increment_by);
         let expected = accumulated;
 
@@ -345,11 +345,11 @@ async fn sub_from_map_item_fuzz_test() -> Result<()> {
                 setup.contract.id(),
                 sub_script.clone(),
                 AdviceInputs::default(),
-                BTreeSet::new(),
+                BTreeMap::new(),
             )
             .await?;
 
-        let got = stack[0].as_int();
+        let got = stack[0].as_canonical_u64();
         accumulated = accumulated.saturating_sub(sub_by);
         let expected = accumulated;
 
@@ -422,11 +422,11 @@ async fn sub_from_storage_item_test() -> Result<()> {
             setup.contract.id(),
             sub_script.clone(),
             AdviceInputs::default(),
-            BTreeSet::new(),
+            BTreeMap::new(),
         )
         .await?;
 
-    let got = stack[0].as_int();
+    let got = stack[0].as_canonical_u64();
 
     let expected = initial_value - sub_by; // 100 - 30
 
@@ -473,7 +473,7 @@ async fn sub_from_storage_item_underflow_test() -> Result<()> {
             setup.contract.id(),
             sub_fail_script,
             AdviceInputs::default(),
-            BTreeSet::new(),
+            BTreeMap::new(),
         )
         .await;
 

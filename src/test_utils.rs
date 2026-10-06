@@ -11,8 +11,11 @@ use crate::{
         deploy_simple_faucets_from_config, deploy_storage_fuzz_dummy, deploy_xyk_pool, fund_wallet,
         instantiate_simple_client, load_test_state, save_test_state, try_import_account,
     },
-    pool_ops::{build_lp_local_deposit_note, get_lp_local_library},
-    utils::{fetch_vault_for_account_from_chain, get_pool_account_code_commitment, slot_name},
+    pool_ops::{build_lp_local_deposit_note, get_amount_in, get_amount_out, get_lp_local_library},
+    utils::{
+        fetch_vault_for_account_from_chain, get_pool_account_code_commitment, slot_name,
+        vault_fungible_balance,
+    },
 };
 use anyhow::{Result, anyhow};
 use miden_client::{
@@ -23,8 +26,7 @@ use miden_client::{
     keystore::FilesystemKeyStore,
     note::NoteTag,
     rpc::Endpoint,
-    store::AccountRecordData,
-    transaction::{OutputNote, TransactionRequestBuilder},
+    transaction::TransactionRequestBuilder,
 };
 
 const DEFAULT_FUND_AMOUNT: u64 = 1_000_000_000_000;
@@ -59,7 +61,7 @@ impl TestSetup {
 
         for asset in self.faucets.iter() {
             let faucet_id = asset.faucet.id();
-            let current = vault.get_balance(faucet_id).unwrap_or(0);
+            let current = vault_fungible_balance(&vault, faucet_id).unwrap_or(0);
             if current >= min_amount {
                 println!(
                     "{}: balance {} >= {}, skipping funding",
@@ -122,7 +124,7 @@ pub async fn lp_local_deposit(
     setup.clients.client.add_note_tag(pool_tag).await?;
 
     let create_req = TransactionRequestBuilder::new()
-        .own_output_notes([OutputNote::Full(deposit_note.clone())])
+        .own_output_notes([deposit_note.clone()])
         .build()?;
     setup
         .clients
@@ -146,22 +148,19 @@ pub async fn lp_local_deposit(
         .client
         .get_account(setup.contract.id())
         .await?
-        .unwrap();
-    let acc = match acc.account_data() {
-        AccountRecordData::Full(a) => a,
-        AccountRecordData::Partial(_) => return Err(anyhow!("Account not found")),
-    };
+        .ok_or_else(|| anyhow!("Account not found"))?;
     let storage = acc.storage();
-    let total_supply = storage.get_item(&slot_name("zoro::lp_local::total_supply"))?[0].as_int();
+    let total_supply =
+        storage.get_item(&slot_name("zoro::lp_local::total_supply"))?[0].as_canonical_u64();
     let reserve = storage.get_item(&slot_name("zoro::lp_local::reserve"))?;
     let vault = acc.vault();
-    let pool_balance0 = vault.get_balance(token0_id)?;
-    let pool_balance1 = vault.get_balance(token1_id)?;
+    let pool_balance0 = vault_fungible_balance(vault, token0_id)?;
+    let pool_balance1 = vault_fungible_balance(vault, token1_id)?;
 
     Ok(PoolState {
         total_supply,
-        reserve0: reserve[0].as_int(),
-        reserve1: reserve[1].as_int(),
+        reserve0: reserve[0].as_canonical_u64(),
+        reserve1: reserve[1].as_canonical_u64(),
         pool_balance0,
         pool_balance1,
     })
@@ -171,7 +170,7 @@ pub async fn lp_local_deposit(
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-fn resolve_endpoint() -> (String, Endpoint) {
+pub fn resolve_endpoint() -> (String, Endpoint) {
     let label = env::var("MIDEN_NODE_ENDPOINT").unwrap_or_else(|_| "localhost".to_string());
     let endpoint = match label.as_str() {
         "testnet" => Endpoint::testnet(),
@@ -323,23 +322,27 @@ async fn resolve_faucets_and_user(
 // ---------------------------------------------------------------------------
 
 pub fn expected_amount_out(amount_in: Felt, reserve_in: Felt, reserve_out: Felt) -> Felt {
-    let fee_adjusted = amount_in.as_int() as u128 * 997;
-    let numerator = reserve_out.as_int() as u128 * fee_adjusted;
-    let denominator = reserve_in.as_int() as u128 * 1000 + fee_adjusted;
-    Felt::new((numerator / denominator) as u64)
+    Felt::new(get_amount_out(
+        amount_in.as_canonical_u64(),
+        reserve_in.as_canonical_u64(),
+        reserve_out.as_canonical_u64(),
+    ))
+    .unwrap()
 }
 
 pub fn expected_amount_in(amount_out: Felt, reserve_in: Felt, reserve_out: Felt) -> Felt {
-    let amount_out_scaled = amount_out.as_int() as u128 * 1000;
-    let numerator = reserve_in.as_int() as u128 * amount_out_scaled;
-    let denominator = (reserve_out.as_int() as u128 - amount_out.as_int() as u128) * 997;
-    Felt::new((numerator / denominator) as u64)
+    Felt::new(get_amount_in(
+        amount_out.as_canonical_u64(),
+        reserve_in.as_canonical_u64(),
+        reserve_out.as_canonical_u64(),
+    ))
+    .unwrap()
 }
 
 pub fn expected_quote(amount_a: Felt, reserve_a: Felt, reserve_b: Felt) -> Felt {
-    let amount_b =
-        amount_a.as_int() as u128 * reserve_b.as_int() as u128 / reserve_a.as_int() as u128;
-    Felt::new(amount_b as u64)
+    let amount_b = amount_a.as_canonical_u64() as u128 * reserve_b.as_canonical_u64() as u128
+        / reserve_a.as_canonical_u64() as u128;
+    Felt::new(amount_b as u64).unwrap()
 }
 
 /// Minimal setup: client + one basic account. No faucets, no contract deployment.
@@ -504,10 +507,11 @@ pub async fn setup_combined_pool_test_environment() -> Result<TestSetup> {
 
     let token0_id = faucets[0].faucet.id();
     let token1_id = faucets[1].faucet.id();
+    let accepted_pool_code_hashes = [get_pool_account_code_commitment()];
     let (registry, _) = deploy_registry(
         &mut clients.client,
         keystore.clone(),
-        get_pool_account_code_commitment(),
+        &accepted_pool_code_hashes,
     )
     .await?;
 
@@ -550,7 +554,7 @@ impl RegistryTestSetup {
 
         for asset in self.faucets.iter() {
             let faucet_id = asset.faucet.id();
-            let current = vault.get_balance(faucet_id).unwrap_or(0);
+            let current = vault_fungible_balance(&vault, faucet_id).unwrap_or(0);
             if current >= min_amount {
                 println!(
                     "{}: balance {} >= {}, skipping funding",
@@ -590,10 +594,11 @@ pub async fn setup_registry_test_environment() -> Result<RegistryTestSetup> {
     let token0_id = faucets[0].faucet.id();
     let token1_id = faucets[1].faucet.id();
 
+    let accepted_pool_code_hashes = [get_pool_account_code_commitment()];
     let (registry, _) = deploy_registry(
         &mut clients.client,
         keystore.clone(),
-        get_pool_account_code_commitment(),
+        &accepted_pool_code_hashes,
     )
     .await?;
 
@@ -611,11 +616,13 @@ pub async fn setup_registry_test_environment() -> Result<RegistryTestSetup> {
     println!("====== XYK POOL DEPLOYED");
 
     let pool_code_hash = pool.code().commitment();
-    println!(
-        "Pool code generated commitment: {:?}",
-        get_pool_account_code_commitment()
-    );
+    let generated_pool_code_hash = get_pool_account_code_commitment();
+    println!("Pool code generated commitment: {generated_pool_code_hash:?}");
     println!("Pool code commitment: {:?}", pool_code_hash);
+    assert_eq!(
+        generated_pool_code_hash, pool_code_hash,
+        "registry seed must match the deployed pool code commitment"
+    );
 
     let pool_tag = NoteTag::with_account_target(pool.id());
     let registry_tag = NoteTag::with_account_target(registry.id());
