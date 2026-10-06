@@ -133,6 +133,38 @@ pub fn get_pool_account_code_commitment() -> Word {
     contract.code().commitment()
 }
 
+pub fn pool_id_registry_key(pool_id: &AccountId) -> Word {
+    Word::new([
+        pool_id.suffix(),
+        pool_id.prefix().as_felt(),
+        Felt::ZERO,
+        Felt::ZERO,
+    ])
+}
+
+pub fn ordered_assets_registry_key(token0: &AccountId, token1: &AccountId) -> Result<Word> {
+    let (lo_pfx, lo_sfx, hi_pfx, hi_sfx) = order_assets_as_felts(
+        token0.prefix().into(),
+        token0.suffix(),
+        token1.prefix().into(),
+        token1.suffix(),
+    )?;
+    Ok(Word::new([lo_pfx, lo_sfx, hi_pfx, hi_sfx]))
+}
+
+/// Decodes the default `zoro::lp_local::assets_mapping` entry written by `deploy_combined_pool`.
+pub fn decode_pool_assets_mapping_word(word: Word) -> Result<(AccountId, AccountId)> {
+    let token1 = AccountId::try_from_elements(word[0], word[1])?;
+    let token0 = AccountId::try_from_elements(word[2], word[3])?;
+    Ok((token0, token1))
+}
+
+pub fn is_empty_registry_word(word: Word) -> bool {
+    word.as_elements()
+        .iter()
+        .all(|felt| felt.as_canonical_u64() == 0)
+}
+
 pub fn order_assets_as_felts(
     a0_pfx: Felt,
     a0_sfx: Felt,
@@ -159,5 +191,51 @@ pub fn order_assets_as_felts(
         ))
     } else {
         Err(anyhow!("Both assets are the same"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use miden_client::account::{AccountIdVersion, AccountType};
+
+    #[test]
+    fn pool_id_registry_key_matches_e2e_layout() {
+        let pool_id = AccountId::dummy([7; 15], AccountIdVersion::Version1, AccountType::Public);
+        let key = pool_id_registry_key(&pool_id);
+        assert_eq!(key[0], pool_id.suffix());
+        assert_eq!(key[1], pool_id.prefix().as_felt());
+        assert_eq!(key[2], Felt::ZERO);
+        assert_eq!(key[3], Felt::ZERO);
+    }
+
+    #[test]
+    fn ordered_assets_registry_key_sorts_ids() {
+        let token0 = AccountId::dummy([1; 15], AccountIdVersion::Version1, AccountType::Public);
+        let token1 = AccountId::dummy([2; 15], AccountIdVersion::Version1, AccountType::Public);
+        let key = ordered_assets_registry_key(&token0, &token1).unwrap();
+        let (lo_pfx, lo_sfx, hi_pfx, hi_sfx) = order_assets_as_felts(
+            token0.prefix().into(),
+            token0.suffix(),
+            token1.prefix().into(),
+            token1.suffix(),
+        )
+        .unwrap();
+        assert_eq!(key, Word::new([lo_pfx, lo_sfx, hi_pfx, hi_sfx]));
+    }
+
+    #[test]
+    fn decode_pool_assets_mapping_word_roundtrip() {
+        let token0 = AccountId::dummy([3; 15], AccountIdVersion::Version1, AccountType::Public);
+        let token1 = AccountId::dummy([4; 15], AccountIdVersion::Version1, AccountType::Public);
+        let stored = Word::new([
+            token1.suffix(),
+            token1.prefix().as_felt(),
+            token0.suffix(),
+            token0.prefix().as_felt(),
+        ]);
+        let (decoded0, decoded1) = decode_pool_assets_mapping_word(stored).unwrap();
+        assert_eq!(decoded0, token0);
+        assert_eq!(decoded1, token1);
     }
 }

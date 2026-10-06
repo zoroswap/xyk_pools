@@ -11,8 +11,11 @@ use crate::{
         deploy_simple_faucets_from_config, deploy_storage_fuzz_dummy, deploy_xyk_pool, fund_wallet,
         instantiate_simple_client, load_test_state, save_test_state, try_import_account,
     },
-    pool_ops::{build_lp_local_deposit_note, get_lp_local_library},
-    utils::{fetch_vault_for_account_from_chain, get_pool_account_code_commitment, slot_name, vault_fungible_balance},
+    pool_ops::{build_lp_local_deposit_note, get_amount_in, get_amount_out, get_lp_local_library},
+    utils::{
+        fetch_vault_for_account_from_chain, get_pool_account_code_commitment, slot_name,
+        vault_fungible_balance,
+    },
 };
 use anyhow::{Result, anyhow};
 use miden_client::{
@@ -147,9 +150,8 @@ pub async fn lp_local_deposit(
         .await?
         .ok_or_else(|| anyhow!("Account not found"))?;
     let storage = acc.storage();
-    let total_supply = storage
-        .get_item(&slot_name("zoro::lp_local::total_supply"))?[0]
-        .as_canonical_u64();
+    let total_supply =
+        storage.get_item(&slot_name("zoro::lp_local::total_supply"))?[0].as_canonical_u64();
     let reserve = storage.get_item(&slot_name("zoro::lp_local::reserve"))?;
     let vault = acc.vault();
     let pool_balance0 = vault_fungible_balance(vault, token0_id)?;
@@ -320,22 +322,26 @@ async fn resolve_faucets_and_user(
 // ---------------------------------------------------------------------------
 
 pub fn expected_amount_out(amount_in: Felt, reserve_in: Felt, reserve_out: Felt) -> Felt {
-    let fee_adjusted = amount_in.as_canonical_u64() as u128 * 997;
-    let numerator = reserve_out.as_canonical_u64() as u128 * fee_adjusted;
-    let denominator = reserve_in.as_canonical_u64() as u128 * 1000 + fee_adjusted;
-    Felt::new((numerator / denominator) as u64).unwrap()
+    Felt::new(get_amount_out(
+        amount_in.as_canonical_u64(),
+        reserve_in.as_canonical_u64(),
+        reserve_out.as_canonical_u64(),
+    ))
+    .unwrap()
 }
 
 pub fn expected_amount_in(amount_out: Felt, reserve_in: Felt, reserve_out: Felt) -> Felt {
-    let amount_out_scaled = amount_out.as_canonical_u64() as u128 * 1000;
-    let numerator = reserve_in.as_canonical_u64() as u128 * amount_out_scaled;
-    let denominator = (reserve_out.as_canonical_u64() as u128 - amount_out.as_canonical_u64() as u128) * 997;
-    Felt::new((numerator / denominator) as u64).unwrap()
+    Felt::new(get_amount_in(
+        amount_out.as_canonical_u64(),
+        reserve_in.as_canonical_u64(),
+        reserve_out.as_canonical_u64(),
+    ))
+    .unwrap()
 }
 
 pub fn expected_quote(amount_a: Felt, reserve_a: Felt, reserve_b: Felt) -> Felt {
-    let amount_b =
-        amount_a.as_canonical_u64() as u128 * reserve_b.as_canonical_u64() as u128 / reserve_a.as_canonical_u64() as u128;
+    let amount_b = amount_a.as_canonical_u64() as u128 * reserve_b.as_canonical_u64() as u128
+        / reserve_a.as_canonical_u64() as u128;
     Felt::new(amount_b as u64).unwrap()
 }
 

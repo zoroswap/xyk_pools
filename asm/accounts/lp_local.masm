@@ -75,8 +75,8 @@ pub proc get_lp_amount_out(total_supply: felt, amount_0: felt, amount_1: felt, r
     ### if total_supply == 0
     loc_load.0 eq.0
     if.true
-        ### initial deposit:  - MINIMUM_LIQUIDITY
-        loc_load.1 loc_load.2 mul exec.math::sqrt 
+        ### initial deposit: sqrt(amount_0 * amount_1) - MINIMUM_LIQUIDITY
+        loc_load.1 loc_load.2 exec.math::sqrt_of_product
         # => [lp_amount]
         push.MINIMUM_LIQUIDITY exec.math::safe_sub
         # => [lp_amount_out]
@@ -84,19 +84,21 @@ pub proc get_lp_amount_out(total_supply: felt, amount_0: felt, amount_1: felt, r
     else
         ### subsequent deposits: min(lp_amount_0, lp_amount_1)
         ### lp_amount_0 = amount_0 * total_supply / reserve_0
-        loc_load.1 u32split loc_load.0 u32split 
-        # => [amount_0_high, amount_0_low, total_supply_high, total_supply_low]
-        exec.u64::wrapping_mul 
-        # => [numerator_high, numerator_low]
-        loc_load.3 u32split 
-        # => [reserve_0_hi, reserve_0_low, numerator_hi, numerator_low]
-        exec.u64::div
-        # => [lp_amount_0_high, lp_amount_0_low]
-        loc_load.2 u32split loc_load.0 u32split exec.u64::wrapping_mul loc_load.4 u32split exec.u64::div
-        # => [lp_amount_1_high, lp_amount_1_low, lp_amount_0_high, lp_amount_0_low]
-        exec.u64::min
-        # => [lp_amount_out_high, lp_amount_out_low]
-        exec.math::safe_cast_u64_into_felt
+        loc_load.1 loc_load.0 loc_load.3 exec.math::mul_div
+        # => [lp_amount_0]
+        loc_load.2 loc_load.0 loc_load.4 exec.math::mul_div
+        # => [lp_amount_1, lp_amount_0]
+        dup.1 dup.1
+        # => [lp_amount_1, lp_amount_0, lp_amount_1, lp_amount_0]
+        exec.math::compare_felts
+        # => [flag, lp_amount_1, lp_amount_0]
+        eq.1
+        if.true
+            # lp_amount_0 is smaller
+            drop
+        else
+            swap drop
+        end
         # => [lp_amount_out]
         ### return lp_amount_out
     end
@@ -112,13 +114,11 @@ pub proc simulate_withdraw#(total_suppply: felt, lp_amount: felt, reserve_0: fel
     # loc.4: amount_0_out
     loc_store.0 loc_store.1 loc_store.2 loc_store.3
     # => []
-    ### amount0 = lp_amount.mul(reserve) / total_suppply; // using balances ensures pro-rata distribution
-    loc_load.1 u32split loc_load.2 u32split exec.u64::wrapping_mul loc_load.0 u32split exec.u64::div
-    # => [amount_0_out_high, amount_0_out_low]
-    exec.math::safe_cast_u64_into_felt loc_store.4
-    loc_load.1 u32split loc_load.3 u32split exec.u64::wrapping_mul loc_load.0 u32split exec.u64::div
-    # => [amount_1_out_high, amount_1_out_low]
-    exec.math::safe_cast_u64_into_felt
+    ### amount0 = lp_amount * reserve_0 / total_supply
+    loc_load.1 loc_load.2 loc_load.0 exec.math::mul_div
+    # => [amount_0_out]
+    loc_store.4
+    loc_load.1 loc_load.3 loc_load.0 exec.math::mul_div
     # => [amount_1_out]
     loc_load.4
     # => [amount_0_out, amount_1_out]
@@ -626,14 +626,14 @@ proc create_register_pool_note()
     exec.output_note::create loc_store.0
     # => []
     ### add network tx attachment targeting the registry
+    loc_load.0
+    # => [note_idx]
     push.DEFAULT_EXEC_HINT
     exec.get_registry_id swap
-    ## => [target_id_suffix, target_id_prefix, exec_hint]
+    ## => [target_id_suffix, target_id_prefix, exec_hint, note_idx]
     exec.network_account_target::new
-    ## => [attachment_scheme, attachment_kind, NOTE_ATTACHMENT]
-    loc_load.0
-    ## => [note_id, attachment_scheme, attachment_kind, NOTE_ATTACHMENT]
-    exec.output_note::add_attachment
+    ## => [attachment_scheme, NOTE_ATTACHMENT, note_idx]
+    exec.output_note::add_word_attachment
     # => []
     exec.sys::truncate_stack
 end

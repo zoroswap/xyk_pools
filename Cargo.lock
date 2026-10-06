@@ -5860,6 +5860,7 @@ dependencies = [
  "miden-client",
  "miden-client-sqlite-store",
  "miden-core 0.25.3",
+ "miden-processor",
  "miden-protocol",
  "miden-standards",
  "miden-tx",

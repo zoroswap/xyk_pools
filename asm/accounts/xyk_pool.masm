@@ -4,7 +4,7 @@ use miden::protocol::active_note
 use miden::protocol::output_note
 #use miden::protocol::asset
 use miden::core::sys
-use miden::core::math::u64
+use miden::core::math::u128
 
 use miden::protocol::note
 use miden::protocol::account_id
@@ -31,6 +31,8 @@ const RESERVE_SLOT = word("zoro::lp_local::reserve")
 
 const ERR_INSUFFICIENT_OUTPUT = "Insufficient output"
 const ERR_ZERO_AMOUNT = "Zero amount"
+const ERR_UNDERFLOW = "Underflow"
+const ERR_OVERFLOW = "Overflow"
 
 
 ### MEMORY LOCATIONS
@@ -63,114 +65,136 @@ const INPUT_NOTE_SERIAL = 52
 
 pub proc quote(amount_A: felt, reserve_A: felt, reserve_B: felt) -> felt
     # => [amount_A, reserve_A, reserve_B]
-    u32split
-    # => [amount_A_high, amount_A_low, reserve_A, reserve_B]
-    movup.3
-    # => [ reserve_B, amount_A_hi, amount_A_lo, reserve_A]
-    u32split
-    # => [reserve_B_high, reserve_B_low, amount_A_hi, amount_A_lo, reserve_A]
-    exec.u64::wrapping_mul
-    # => [numerator_high, numerator_low, reserve_A]
     movup.2
-    # => [reserve_A, numerator_high, numerator_low]
-    u32split
-    # => [reserve_A_high, reserve_A_low, numerator_high, numerator_low]
-    exec.u64::div
-    # => [amount_B_high, amount_B_low]
-    exec.math::safe_cast_u64_into_felt
+    # => [reserve_B, amount_A, reserve_A]
+    movup.2
+    # => [reserve_A, reserve_B, amount_A]
+    # amount_B = amount_A * reserve_B / reserve_A
+    exec.math::mul_div
     # => [amount_B]
     exec.sys::truncate_stack
-end 
+end
 
 
 #@todo factor out fee amount and make it configurable
-@locals(6)
+const GAO_AMOUNT_IN = 0
+const GAO_RESERVE_IN = 1
+const GAO_RESERVE_OUT = 2
+const GAO_FEE = 4
+const GAO_NUM = 8
+@locals(12)
 pub proc get_amount_out_u64(amount_in: felt, reserve_in: felt, reserve_out: felt) -> felt
-    # loc.0: reserve_in
-    # loc.1: reserve_out
-    # loc.2: amount_in
-    # loc.3: unused
-    # loc.4: amount_in_with_fee_high
-    # loc.5: amount_in_with_fee_low
- 
-    loc_store.2 loc_store.0 loc_store.1
-    
-    # amount_in
-    loc_load.2 u32split 
-    # => [amount_in_lo, amount_in_hi]
-    push.997 u32split
-    # => [997_lo, 997_hi, amount_in_lo, amount_in_hi]
-    # @note: consider overflowing mul
+    # => [amount_in, reserve_in, reserve_out]
+    loc_store.GAO_AMOUNT_IN
+    # => [reserve_in, reserve_out]
+    loc_store.GAO_RESERVE_IN
+    # => [reserve_out]
+    loc_store.GAO_RESERVE_OUT
+    # => []
 
-    exec.u64::wrapping_mul
+    # fee = amount_in * 997
+    loc_load.GAO_AMOUNT_IN exec.math::felt_to_u128
+    # => [amount_in_u128]
+    push.0.0.0.997
+    # => [997, amount_in_u128]
+    exec.u128::overflowing_mul
+    # => [overflow, fee]
+    eq.0 assert.err=ERR_OVERFLOW
+    # => [FEE]
+    loc_storew_le.GAO_FEE
+    # => [FEE]
 
-    # => [amount_in_with_fee_lo, amount_in_with_fee_hi]
-    loc_store.4 loc_store.5 loc_load.5 loc_load.4
-    # => [amount_in_with_fee_lo, amount_in_with_fee_hi]
-    ## reserve_out 
-    loc_load.1 u32split 
-    # => [reserve_out_lo, reserve_out_hi, amount_in_with_fee_lo, amount_in_with_fee_hi]
-    # numerator = amount_in_with_fee * reserve_out
+    # numerator = fee * reserve_out
+    loc_load.GAO_RESERVE_OUT exec.math::felt_to_u128
+    # => [RESERVE_OUT_U128, FEE]
+    exec.u128::overflowing_mul
+    # => [overflow, NUMERATOR]
+    eq.0 assert.err=ERR_OVERFLOW
+    # => [NUMERATOR]
+    loc_storew_le.GAO_NUM
+    # => [NUMERATOR]
 
-    exec.u64::wrapping_mul
+    # denominator = reserve_in * 1000 + fee
+    loc_load.GAO_RESERVE_IN exec.math::felt_to_u128
+    push.0.0.0.1000
+    # => [0.0.0.1000, RESERVE_IN_U128]
+    exec.u128::overflowing_mul
+    # => [overflow, RESERVE_IN_SCALED]
+    eq.0 assert.err=ERR_OVERFLOW
+    # => [RESERVE_IN_SCALED]
+    padw loc_loadw_le.GAO_FEE
+    # => [FEE, RESERVE_IN_SCALED]
+    exec.u128::overflowing_add
+    # => [overflow, denominator]
+    eq.0 assert.err=ERR_OVERFLOW
+    # => [denominator]
+    loc_storew_le.GAO_FEE dropw
+    # => []
 
-    # => [numerator_lo, numerator_hi]
-    # reserve_in
-    loc_load.0 u32split push.1000 u32split exec.u64::wrapping_mul
-
-    # => [reserve_in_scaled_lo, reserve_in_scaled_hi, numerator_lo, numerator_hi]
-    # amount_in_with_fee
-    loc_load.5 loc_load.4
-    # => [amount_in_with_fee_lo, amount_in_with_fee_hi, reserve_in_scaled_lo, reserve_in_scaled_hi, numerator_lo, numerator_hi]
-    # denominator = reserve_in_scaled + amount_in_with_fee
-
-    exec.u64::wrapping_add
-
-    # => [denominator_lo, denominator_hi, numerator_lo, numerator_hi]
-    exec.u64::div
-
-    # => [amount_out_lo, amount_out_hi]
-    exec.math::safe_cast_u64_into_felt
-    # => [amount_out]    exec.sys::truncate_stack
+    padw loc_loadw_le.GAO_NUM
+    # => [numerator]
+    padw loc_loadw_le.GAO_FEE
+    # => [denominator, numerator]
+    exec.u128::div
+    # => [amount_out_u128]
+    exec.math::safe_cast_u128_into_felt
+    # => [amount_out]
+    exec.sys::truncate_stack
 end
 
 #@todo factor out fee amount and make it configurable
-@locals(3)
+const GAI_AMOUNT_OUT = 0
+const GAI_RESERVE_IN = 1
+const GAI_RESERVE_OUT = 2
+const GAI_SCALED = 4
+const GAI_NUM = 8
+@locals(12)
 pub proc get_amount_in_u64(amount_out: felt, reserve_in: felt, reserve_out: felt) -> felt
-    # loc.0: reserve_in
-    # loc.1: reserve_out
-    # loc.2: amount_out
+    # => [amount_out, reserve_in, reserve_out]
+    loc_store.GAI_AMOUNT_OUT
+    # => [reserve_in, reserve_out]
+    loc_store.GAI_RESERVE_IN
+    # => [reserve_out]
+    loc_store.GAI_RESERVE_OUT
+    # => []
 
-    loc_store.2 loc_store.0 loc_store.1
-    
-    # amount_out
-    loc_load.2 u32split 
-    # => [amount_out_lo, amount_out_hi]
-    push.1000 u32split
-    # => [1000_lo, 1000_hi, amount_out_lo, amount_out_hi]
-    # @note: consider overflowing mul
-    exec.u64::wrapping_mul
-    # => [amount_out_scaled_lo, amount_out_scaled_hi]
-    ## reserve_in 
-    loc_load.0 u32split 
-    # => [reserve_in_lo, reserve_in_hi, amount_out_scaled_lo, amount_out_scaled_hi]
-    # numerator = amount_out_scaled * reserve_in
-    exec.u64::wrapping_mul
-    # => [numerator_scaled_lo, numerator_scaled_hi]
-    ## denominator = (reserve_out - amount_out) * (1-fee)
-    ## reserve_out
-    loc_load.1 u32split 
-    # => [reserve_out_lo, reserve_out_hi, numerator_scaled_lo, numerator_scaled_hi]
-    ## amount_out
-    loc_load.2 u32split
-    # => [amount_out_lo, amount_out_hi, reserve_out_lo, reserve_out_hi, numerator_scaled_lo, numerator_scaled_hi]
-    exec.u64::wrapping_sub
-    # => [denominator_lo, denominator_hi, numerator_scaled_lo, numerator_scaled_hi]
-    push.997 u32split exec.u64::wrapping_mul
-    # => [denominator_with_fee_lo, denominator_with_fee_hi, numerator_scaled_lo, numerator_scaled_hi]
-    exec.u64::div
-    # => [amount_in_lo, amount_in_hi]
-    exec.math::safe_cast_u64_into_felt
+    # numerator = amount_out * 1000 * reserve_in
+    loc_load.GAI_AMOUNT_OUT exec.math::felt_to_u128
+    push.0.0.0.1000
+    exec.u128::overflowing_mul
+    # => [overflow, amount_out_scaled]
+    eq.0 assert.err=ERR_OVERFLOW
+    # => [amount_out_scaled]
+    loc_storew_le.GAI_SCALED dropw
+    padw loc_loadw_le.GAI_SCALED
+    loc_load.GAI_RESERVE_IN exec.math::felt_to_u128
+    exec.u128::overflowing_mul
+    # => [overflow, numerator]
+    eq.0 assert.err=ERR_OVERFLOW
+    # => [numerator]
+    loc_storew_le.GAI_NUM dropw
+    # => []
+
+    # denominator = (reserve_out - amount_out) * 997
+    loc_load.GAI_RESERVE_OUT exec.math::felt_to_u128
+    loc_load.GAI_AMOUNT_OUT exec.math::felt_to_u128
+    # => [amount_out_u128, reserve_out_u128]
+    exec.u128::overflowing_sub
+    # => [underflow, difference]
+    eq.0 assert.err=ERR_UNDERFLOW
+    # => [difference]
+    push.0.0.0.997
+    exec.u128::overflowing_mul
+    # => [overflow, denominator]
+    eq.0 assert.err=ERR_OVERFLOW
+    # => [denominator]
+    loc_storew_le.GAI_SCALED dropw
+
+    padw loc_loadw_le.GAI_NUM
+    padw loc_loadw_le.GAI_SCALED
+    # => [denominator, numerator]
+    exec.u128::div
+    exec.math::safe_cast_u128_into_felt
     # => [amount_in]
     exec.sys::truncate_stack
 end

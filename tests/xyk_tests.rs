@@ -1,5 +1,5 @@
 use anyhow::Result;
-use miden_client::{Felt, transaction::AdviceInputs};
+use miden_client::{transaction::AdviceInputs, Felt};
 use xyk_pool::{
     pool_ops::{
         compile_custom_tx_script, get_math_library, get_pool_library, get_registry_library, isqrt,
@@ -9,6 +9,25 @@ use xyk_pool::{
 };
 
 use std::{collections::BTreeMap, time::Duration};
+
+/// Largest felt `x` such that `x * factor * x` fits in a u128.
+fn largest_symmetric_product(factor: u128) -> u64 {
+    let mut lo = 1u64;
+    let mut hi = u64::MAX - u32::MAX as u64;
+    while lo < hi {
+        let mid = lo + (hi - lo + 1) / 2;
+        let fits = (mid as u128)
+            .checked_mul(factor)
+            .and_then(|v| v.checked_mul(mid as u128))
+            .is_some();
+        if fits {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo
+}
 
 #[tokio::test]
 async fn get_amount_out_u64_fuzz_test() -> Result<()> {
@@ -24,11 +43,23 @@ async fn get_amount_out_u64_fuzz_test() -> Result<()> {
 
     let pool_library = get_pool_library()?;
     let mut rng = rand::rng();
+    let near = largest_symmetric_product(997);
+    let edge_cases = [(near, near, near), (1, 1, 1), (1_000, 50_000, 50_000)];
 
-    for i in 0..iterations {
-        let reserve_in = Felt::new(rng.random_range(min_reserve..=max_reserve)).unwrap();
-        let reserve_out = Felt::new(rng.random_range(min_reserve..=max_reserve)).unwrap();
-        let amount_in = Felt::new(rng.random_range(min_amount_in..=max_amount_in)).unwrap();
+    for (i, (amount_in_raw, reserve_in_raw, reserve_out_raw)) in edge_cases
+        .into_iter()
+        .chain((0..iterations).map(|_| {
+            (
+                rng.random_range(min_amount_in..=max_amount_in),
+                rng.random_range(min_reserve..=max_reserve),
+                rng.random_range(min_reserve..=max_reserve),
+            )
+        }))
+        .enumerate()
+    {
+        let reserve_in = Felt::new(reserve_in_raw).unwrap();
+        let reserve_out = Felt::new(reserve_out_raw).unwrap();
+        let amount_in = Felt::new(amount_in_raw).unwrap();
 
         let source = format!(
             "use zoro::xyk_pool\n\
@@ -103,11 +134,23 @@ async fn quote_fuzz_test() -> Result<()> {
     let mut setup = setup_lightweight_environment().await?;
     let pool_library = get_pool_library()?;
     let mut rng = rand::rng();
+    let felt_max: u64 = u64::MAX - u32::MAX as u64;
+    let edge_cases = [(felt_max, felt_max, felt_max), (1, 1, 1)];
 
-    for i in 0..iterations {
-        let reserve_a = Felt::new(rng.random_range(min_reserve..=max_reserve)).unwrap();
-        let reserve_b = Felt::new(rng.random_range(min_reserve..=max_reserve)).unwrap();
-        let amount_a = Felt::new(rng.random_range(min_amount..=max_amount)).unwrap();
+    for (i, (amount_raw, reserve_a_raw, reserve_b_raw)) in edge_cases
+        .into_iter()
+        .chain((0..iterations).map(|_| {
+            (
+                rng.random_range(min_amount..=max_amount),
+                rng.random_range(min_reserve..=max_reserve),
+                rng.random_range(min_reserve..=max_reserve),
+            )
+        }))
+        .enumerate()
+    {
+        let reserve_a = Felt::new(reserve_a_raw).unwrap();
+        let reserve_b = Felt::new(reserve_b_raw).unwrap();
+        let amount_a = Felt::new(amount_raw).unwrap();
 
         let source = format!(
             "use zoro::xyk_pool\n\
@@ -172,11 +215,23 @@ async fn get_amount_in_u64_fuzz_test() -> Result<()> {
 
     let pool_library = get_pool_library()?;
     let mut rng = rand::rng();
+    let near = largest_symmetric_product(1000);
+    let edge_cases = [(near, near, near * 2), (1, 1, 2)];
 
-    for i in 0..iterations {
-        let reserve_in = Felt::new(rng.random_range(min_reserve..=max_reserve)).unwrap();
-        let reserve_out = Felt::new(rng.random_range(min_reserve..=max_reserve)).unwrap();
-        let amount_out = Felt::new(rng.random_range(min_amount_out..=max_amount_out)).unwrap();
+    for (i, (amount_out_raw, reserve_in_raw, reserve_out_raw)) in edge_cases
+        .into_iter()
+        .chain((0..iterations).map(|_| {
+            (
+                rng.random_range(min_amount_out..=max_amount_out),
+                rng.random_range(min_reserve..=max_reserve),
+                rng.random_range(min_reserve..=max_reserve),
+            )
+        }))
+        .enumerate()
+    {
+        let reserve_in = Felt::new(reserve_in_raw).unwrap();
+        let reserve_out = Felt::new(reserve_out_raw).unwrap();
+        let amount_out = Felt::new(amount_out_raw).unwrap();
 
         let source = format!(
             "use zoro::xyk_pool\n\

@@ -2,8 +2,6 @@ use miden::protocol::active_account
 use miden::protocol::native_account
 use miden::protocol::tx
 #use miden::protocol::asset_id
-use miden::core::math::u64
-
 use miden::core::sys
 
 
@@ -65,9 +63,9 @@ pub proc register_pool(
     eq.0 assert.err=ERR_POOL_FOR_ASSETS_ALREADY_REGISTERED
 
     ### get pool code hash via FPI
-    procref.xyk_pool::get_account_code_commitment mem_load.POOL_ID_SUFFIX mem_load.POOL_ID_PREFIX
-
-    # => [pool_id_prefix, pool_id_suffix, GET_CODE_COMMITMENT_HASH]
+    padw padw padw padw
+    procref.xyk_pool::get_account_code_commitment
+    mem_load.POOL_ID_PREFIX mem_load.POOL_ID_SUFFIX
     exec.tx::execute_foreign_procedure loc_storew_le.0
 
     # => [POOL_CODE_HASH]

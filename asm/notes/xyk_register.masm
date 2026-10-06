@@ -40,8 +40,8 @@ end
 
 proc validate_consumer()
     exec.active_account::get_id
-    # => [consumer_prefix, consumer_suffix]
-    mem_load.REGISTRY_SUFFIX mem_load.REGISTRY_PREFIX
-    # => [registry_prefix, registry_suffix, consumer_prefix, consumer_suffix]
+    # => [consumer_suffix, consumer_prefix]
+    mem_load.REGISTRY_PREFIX mem_load.REGISTRY_SUFFIX
+    # => [registry_suffix, registry_prefix, consumer_suffix, consumer_prefix]
     exec.account_id::is_equal assert.err=ERR_REGISTER_TARGET_ACCT_MISMATCH
 end

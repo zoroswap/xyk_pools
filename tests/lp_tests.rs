@@ -28,11 +28,14 @@ async fn get_lp_amount_out_fuzz_test() -> Result<()> {
     let lp_local_library = get_lp_local_library()?;
     let mut rng = rand::rng();
 
+    let felt_max: u64 = u64::MAX - u32::MAX as u64;
     let edge_cases: Vec<(u64, u64, u64, u64, u64)> = vec![
         (0, 100, 100, 0, 0),
         (0, 1_000_000, 1_000_000, 0, 0),
+        (0, felt_max, felt_max, 0, 0),
         (1000, 100, 100, 1000, 1000),
         (10000, 500, 500, 50000, 50000),
+        (felt_max, felt_max, felt_max, felt_max, felt_max),
     ];
 
     for (i, (total_supply, amount_0, amount_1, reserve_0, reserve_1)) in edge_cases
@@ -136,11 +139,13 @@ async fn simulate_withdraw_fuzz_test() -> Result<()> {
     let lp_local_library = get_lp_local_library()?;
     let mut rng = rand::rng();
 
+    let felt_max: u64 = u64::MAX - u32::MAX as u64;
     let edge_cases: Vec<(u64, u64, u64, u64)> = vec![
         (100, 100, 100, 0),
         (1_000_000, 1_000_000, 1_000_000, 0),
         (1000, 100, 100, 1000),
         (10000, 500, 500, 50000),
+        (felt_max, felt_max, felt_max, felt_max),
     ];
 
     for (i, (total_supply, lp_amount, reserve_0, reserve_1)) in edge_cases
@@ -544,10 +549,8 @@ async fn lp_burn_fuzz_test() -> Result<()> {
 
     let acc_after_storage = acc_after.storage();
     let usr_key = Word::new([Felt::ZERO, Felt::ZERO, suffix, prefix]);
-    let usr_depo = acc_after_storage.get_map_item(
-        &slot_name("zoro::lp_local::user_deposits_mapping"),
-        usr_key,
-    )?;
+    let usr_depo = acc_after_storage
+        .get_map_item(&slot_name("zoro::lp_local::user_deposits_mapping"), usr_key)?;
     println!("usr_depo: after mint {:?}", usr_depo);
 
     let mut expected_total_supply: u64 = initial_mint;

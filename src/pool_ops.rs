@@ -2,9 +2,8 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock};
 
 use crate::utils::{get_p2id_root_hash, read_masm_to_string};
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use miden_client::{
-    Felt, Word,
     account::AccountId,
     assembly::{
         Assembler, DefaultSourceManager, Library, MastForest, Module, ModuleKind,
@@ -12,6 +11,7 @@ use miden_client::{
     },
     asset::FungibleAsset,
     note::{Note, NoteAssets, NoteRecipient, NoteTag, NoteType, PartialNoteMetadata},
+    Felt, Word,
 };
 use miden_protocol::{
     assembly::LibraryExport,
@@ -153,7 +153,7 @@ pub fn get_pool_library() -> Result<Arc<Library>> {
         .map_err(|e| anyhow!("Failed to compile pool library: {e:?}"))
 }
 
-/// Compiles the math MASM library (sqrt, safe_sub, safe_cast_u64_into_felt, etc.).
+/// Compiles the math MASM library (sqrt, mul_div, safe_sub, etc.).
 pub fn get_math_library() -> Result<Arc<Library>> {
     let source = read_masm_to_string("accounts", "math")?;
     let assembler = kernel_assembler().with_warnings_as_errors(true);
@@ -236,7 +236,7 @@ pub fn compile_lp_local_fuzz_tx_script(source: &str) -> Result<TransactionScript
 pub fn get_registry_library() -> Result<Arc<Library>> {
     let math_library = get_math_library()?;
     let storage_utils_library = get_storage_utils_library()?;
-    let xyk_pool_library = get_pool_library()?;
+    let xyk_pool_library = get_combined_pool_library()?;
     let static_libs = [
         math_library.clone(),
         storage_utils_library.clone(),
@@ -679,20 +679,39 @@ pub fn compute_expected_withdraw(
     (amount_0 as u64, amount_1 as u64)
 }
 
+fn u128_mul(a: u128, b: u128) -> u128 {
+    a.checked_mul(b).expect("product does not fit in u128")
+}
+
+fn felt_from_quotient(q: u128) -> u64 {
+    let felt_max = u64::MAX - u32::MAX as u64;
+    assert!(q <= felt_max as u128, "quotient does not fit in a felt");
+    q as u64
+}
+
 /// Expected output amount for a swap (0.3% fee).
+/// Panics when `amount_in * 997 * reserve_out` does not fit in a u128.
 pub fn get_amount_out(amount_in: u64, reserve_in: u64, reserve_out: u64) -> u64 {
-    let fee_adjusted = amount_in as u128 * 997;
-    let numerator = reserve_out as u128 * fee_adjusted;
-    let denominator = reserve_in as u128 * 1000 + fee_adjusted;
-    (numerator / denominator) as u64
+    let fee_adjusted = u128_mul(amount_in as u128, 997);
+    let numerator = u128_mul(fee_adjusted, reserve_out as u128);
+    let denominator = u128_mul(reserve_in as u128, 1000)
+        .checked_add(fee_adjusted)
+        .expect("denominator overflow");
+    assert!(denominator != 0, "division by zero");
+    felt_from_quotient(numerator / denominator)
 }
 
 /// Expected input amount for a swap (0.3% fee).
+/// Panics when `amount_out * 1000 * reserve_in` does not fit in a u128.
 pub fn get_amount_in(amount_out: u64, reserve_in: u64, reserve_out: u64) -> u64 {
-    let amount_out_scaled = amount_out as u128 * 1000;
-    let numerator = reserve_in as u128 * amount_out_scaled;
-    let denominator = (reserve_out as u128 - amount_out as u128) * 997;
-    (numerator / denominator) as u64
+    let amount_out_scaled = u128_mul(amount_out as u128, 1000);
+    let numerator = u128_mul(amount_out_scaled, reserve_in as u128);
+    let remaining = (reserve_out as u128)
+        .checked_sub(amount_out as u128)
+        .expect("underflow");
+    let denominator = u128_mul(remaining, 997);
+    assert!(denominator != 0, "division by zero");
+    felt_from_quotient(numerator / denominator)
 }
 
 /// Integer square root (Newton's method, floor).
@@ -729,6 +748,75 @@ mod tests {
         assert!(out > 970 && out < 1000, "out={out}");
     }
 
+    /// Largest `x` such that `x * factor * x` fits in a u128 and `x` is a felt.
+    fn largest_symmetric_product(factor: u128) -> u64 {
+        let mut lo = 1u64;
+        let mut hi = u64::MAX - u32::MAX as u64;
+        while lo < hi {
+            let mid = lo + (hi - lo + 1) / 2;
+            let fits = (mid as u128)
+                .checked_mul(factor)
+                .and_then(|v| v.checked_mul(mid as u128))
+                .is_some();
+            if fits {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        lo
+    }
+
+    #[test]
+    fn test_u128_mul_div_roundtrip() {
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            state
+        };
+        let mut checked = 0;
+        for _ in 0..200 {
+            let d = (next() as u128) | 1;
+            let q = next() as u128;
+            let Some(prod) = q.checked_mul(d) else {
+                continue;
+            };
+            let r = (next() as u128) % d;
+            let Some(n) = prod.checked_add(r) else {
+                continue;
+            };
+            assert_eq!(n / d, q);
+            checked += 1;
+        }
+        assert!(checked > 0, "no fitting products were checked");
+    }
+
+    #[test]
+    fn test_get_amount_out_near_u128_limit() {
+        let x = largest_symmetric_product(997);
+        let expected = (x as u128) * 997 * (x as u128) / ((x as u128) * 1000 + (x as u128) * 997);
+        assert_eq!(get_amount_out(x, x, x), expected as u64);
+        let overflow = x.checked_add(1).expect("room above the limit");
+        assert!((overflow as u128)
+            .checked_mul(997)
+            .and_then(|v| v.checked_mul(overflow as u128))
+            .is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "product does not fit in u128")]
+    fn test_get_amount_out_felt_max_overflows() {
+        let felt_max = u64::MAX - u32::MAX as u64;
+        let _ = get_amount_out(felt_max, felt_max, felt_max);
+    }
+
+    #[test]
+    fn test_math_and_pool_libraries_compile() {
+        get_math_library().expect("math library");
+        get_lp_local_library().expect("lp_local library");
+        get_pool_library().expect("pool library");
+    }
+
     #[test]
     fn test_lp_local_deposit_note_script_compiles() {
         let lp_lib = get_lp_local_library().expect("lp_local library");
@@ -738,6 +826,287 @@ mod tests {
             "lp_local deposit note script: {:?}",
             result.err()
         );
+    }
+
+    fn run_vm(source: &str, libs: &[Arc<Library>]) -> Result<Vec<u64>, String> {
+        let mut assembler = kernel_assembler().with_warnings_as_errors(true);
+        for lib in libs {
+            assembler = assembler
+                .with_static_library(lib.clone())
+                .map_err(|e| format!("link: {e:?}"))?;
+        }
+        let program = assembler
+            .assemble_program(source)
+            .map_err(|e| format!("assemble: {e:?}"))?;
+        let program = merge_static_error_codes_into_program(program, libs);
+        let mut host = miden_processor::DefaultHost::default();
+        let core = miden_protocol::CoreLibrary::default();
+        host.load_library(&core)
+            .map_err(|e| format!("host: {e:?}"))?;
+        let output = miden_processor::execute_sync(
+            &program,
+            miden_processor::StackInputs::new(&[]).expect("empty stack inputs"),
+            miden_processor::advice::AdviceInputs::default(),
+            &mut host,
+            miden_processor::ExecutionOptions::default(),
+        )
+        .map_err(|e| e.to_string())?;
+        Ok((0..8)
+            .map(|i| {
+                output
+                    .stack
+                    .get_element(i)
+                    .expect("stack output")
+                    .as_canonical_u64()
+            })
+            .collect())
+    }
+
+    fn felt_max() -> u64 {
+        u64::MAX - u32::MAX as u64
+    }
+
+    #[test]
+    fn test_vm_u128_mul_div_and_sqrt() {
+        let math = get_math_library().expect("math library");
+        let libs = [math];
+        let f = felt_max();
+
+        let small = run_vm(
+            "use zoro::math\n\
+             begin\n\
+                 push.20.1.3\n\
+                 exec.math::mul_div\n\
+             end",
+            &libs,
+        )
+        .expect("20/3");
+        assert_eq!(small[0], 6);
+
+        let hi = f >> 32;
+        let lo = f as u32;
+        let direct_cast = run_vm(
+            &format!(
+                "use zoro::math\n\
+                 use miden::core::sys\n\
+                 begin\n\
+                     push.0.0.{hi}.{lo}\n\
+                     exec.math::safe_cast_u128_into_felt\n\
+                     exec.sys::truncate_stack\n\
+                 end"
+            ),
+            &libs,
+        )
+        .expect("cast felt_max");
+        assert_eq!(direct_cast[0], f);
+
+        let high_limb = run_vm(
+            "use zoro::math\n\
+             begin\n\
+                 push.0.1.0.0\n\
+                 exec.math::safe_cast_u128_into_felt\n\
+             end",
+            &libs,
+        );
+        assert!(high_limb.is_err(), "a set high limb must not cast");
+
+        let div_zero = run_vm(
+            "use zoro::math\n\
+             begin\n\
+                 push.1.1.0\n\
+                 exec.math::mul_div\n\
+             end",
+            &libs,
+        );
+        assert!(div_zero.is_err(), "division by zero must fail");
+
+        for n in [0u64, 1, 2, 10, 144, 10_000 * 50_000, f] {
+            let got = run_vm(
+                &format!(
+                    "use zoro::math\n\
+                     begin\n\
+                         push.{n}\n\
+                         exec.math::sqrt\n\
+                     end"
+                ),
+                &libs,
+            )
+            .unwrap_or_else(|e| panic!("sqrt({n}): {e}"));
+            assert_eq!(got[0], isqrt(n as u128) as u64, "sqrt({n})");
+        }
+
+        let cast = run_vm(
+            &format!(
+                "use zoro::math\n\
+                 begin\n\
+                     push.{f}.1.1\n\
+                     exec.math::mul_div\n\
+                 end"
+            ),
+            &libs,
+        )
+        .expect("felt_max/1");
+        assert_eq!(cast[0], f, "felt_max/1 stack={cast:?}");
+
+        let mul = run_vm(
+            &format!(
+                "use zoro::math\n\
+                 begin\n\
+                     push.{f}.{f}.{f}\n\
+                     exec.math::mul_div\n\
+                 end"
+            ),
+            &libs,
+        )
+        .expect("mul_div felt_max");
+        assert_eq!(mul[0], f, "mul_div stack={mul:?}");
+
+        let product = run_vm(
+            &format!(
+                "use zoro::math\n\
+                 begin\n\
+                     push.{f}.{f}\n\
+                     exec.math::sqrt_of_product\n\
+                 end"
+            ),
+            &libs,
+        )
+        .expect("sqrt of product");
+        let expected_product = isqrt(f as u128 * f as u128) as u64;
+        assert_eq!(product[0], expected_product);
+    }
+
+    #[test]
+    fn test_vm_swap_quote_and_lp() {
+        let pool = get_pool_library().expect("pool library");
+        let lp = get_lp_local_library().expect("lp library");
+        let felt_max = felt_max();
+
+        let near_out = largest_symmetric_product(997);
+        let out_cases = [
+            (near_out, near_out, near_out),
+            (1, 1, 1),
+            (1_000, 50_000, 50_000),
+            (100_000, 1_000_000_000, 100_000_000_000),
+        ];
+        for (amount_in, reserve_in, reserve_out) in out_cases {
+            let got = run_vm(
+                &format!(
+                    "use zoro::xyk_pool\n\
+                     begin\n\
+                         push.{reserve_out}.{reserve_in}.{amount_in}\n\
+                         exec.xyk_pool::get_amount_out_u64\n\
+                     end"
+                ),
+                &[pool.clone()],
+            )
+            .unwrap_or_else(|e| panic!("amount_out {amount_in},{reserve_in},{reserve_out}: {e}"));
+            assert_eq!(
+                got[0],
+                get_amount_out(amount_in, reserve_in, reserve_out),
+                "amount_out {amount_in},{reserve_in},{reserve_out}"
+            );
+        }
+
+        let quote_cases = [
+            (felt_max, felt_max, felt_max),
+            (1, 1, 1),
+            (1_000, 4_000, 9_000),
+        ];
+        for (amount, reserve_a, reserve_b) in quote_cases {
+            let got = run_vm(
+                &format!(
+                    "use zoro::xyk_pool\n\
+                     begin\n\
+                         push.{reserve_b}.{reserve_a}.{amount}\n\
+                         exec.xyk_pool::quote\n\
+                     end"
+                ),
+                &[pool.clone()],
+            )
+            .unwrap_or_else(|e| panic!("quote {amount},{reserve_a},{reserve_b}: {e}"));
+            let expected = amount as u128 * reserve_b as u128 / reserve_a as u128;
+            assert_eq!(got[0], expected as u64, "quote {amount}");
+        }
+
+        let near_in = largest_symmetric_product(1000);
+        let in_cases = [
+            (near_in, near_in, near_in * 2),
+            (1, 1, 2),
+            (100, 50_000, 80_000),
+        ];
+        for (amount_out, reserve_in, reserve_out) in in_cases {
+            let got = run_vm(
+                &format!(
+                    "use zoro::xyk_pool\n\
+                     begin\n\
+                         push.{reserve_out}.{reserve_in}.{amount_out}\n\
+                         exec.xyk_pool::get_amount_in_u64\n\
+                     end"
+                ),
+                &[pool.clone()],
+            )
+            .unwrap_or_else(|e| panic!("amount_in {amount_out},{reserve_in},{reserve_out}: {e}"));
+            assert_eq!(
+                got[0],
+                get_amount_in(amount_out, reserve_in, reserve_out),
+                "amount_in {amount_out},{reserve_in},{reserve_out}"
+            );
+        }
+
+        let lp_cases = [
+            (0, felt_max, felt_max, 0, 0),
+            (felt_max, felt_max, felt_max, felt_max, felt_max),
+            (0, 10_000, 10_000, 0, 0),
+            (1_000_000, 5_000, 9_000, 50_000, 80_000),
+            (1_000_000, 9_000, 1_000, 50_000, 80_000),
+        ];
+        for (total, amount_0, amount_1, reserve_0, reserve_1) in lp_cases {
+            let got = run_vm(
+                &format!(
+                    "use zoro::lp_local\n\
+                     begin\n\
+                         push.{reserve_1}.{reserve_0}.{amount_1}.{amount_0}.{total}\n\
+                         exec.lp_local::get_lp_amount_out\n\
+                     end"
+                ),
+                &[lp.clone()],
+            )
+            .unwrap_or_else(|e| panic!("lp {total},{amount_0},{amount_1}: {e}"));
+            assert_eq!(
+                got[0],
+                compute_expected_lp(amount_0, amount_1, reserve_0, reserve_1, total),
+                "lp {total},{amount_0},{amount_1},{reserve_0},{reserve_1}"
+            );
+        }
+
+        let withdraw = run_vm(
+            &format!(
+                "use zoro::lp_local\n\
+                 begin\n\
+                     push.{felt_max}.{felt_max}.{felt_max}.{felt_max}\n\
+                     exec.lp_local::simulate_withdraw\n\
+                 end"
+            ),
+            &[lp.clone()],
+        )
+        .expect("withdraw");
+        let (amount_0, amount_1) =
+            compute_expected_withdraw(felt_max, felt_max, felt_max, felt_max);
+        assert_eq!(withdraw[0], amount_0);
+        assert_eq!(withdraw[1], amount_1);
+
+        let overflow = run_vm(
+            &format!(
+                "use zoro::xyk_pool\n\
+                 begin\n\
+                     push.{felt_max}.{felt_max}.{felt_max}\n\
+                     exec.xyk_pool::get_amount_out_u64\n\
+                 end"
+            ),
+            &[pool.clone()],
+        );
+        assert!(overflow.is_err(), "felt-max swap must overflow u128");
     }
 
     #[test]

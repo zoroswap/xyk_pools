@@ -32,3 +32,6 @@ tokio = { version = "1.46", features = [
 toml = "0.9.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+miden-processor = "=0.23.5"
