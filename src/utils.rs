@@ -135,10 +135,10 @@ pub fn get_pool_account_code_commitment() -> Word {
 
 pub fn pool_id_registry_key(pool_id: &AccountId) -> Word {
     Word::new([
-        pool_id.suffix(),
+        Felt::ZERO,
+        Felt::ZERO,
         pool_id.prefix().as_felt(),
-        Felt::ZERO,
-        Felt::ZERO,
+        pool_id.suffix(),
     ])
 }
 
@@ -203,10 +203,10 @@ mod tests {
     fn pool_id_registry_key_matches_e2e_layout() {
         let pool_id = AccountId::dummy([7; 15], AccountIdVersion::Version1, AccountType::Public);
         let key = pool_id_registry_key(&pool_id);
-        assert_eq!(key[0], pool_id.suffix());
-        assert_eq!(key[1], pool_id.prefix().as_felt());
-        assert_eq!(key[2], Felt::ZERO);
-        assert_eq!(key[3], Felt::ZERO);
+        assert_eq!(key[0], Felt::ZERO);
+        assert_eq!(key[1], Felt::ZERO);
+        assert_eq!(key[2], pool_id.prefix().as_felt());
+        assert_eq!(key[3], pool_id.suffix());
     }
 
     #[test]

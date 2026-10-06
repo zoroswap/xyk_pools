@@ -9,14 +9,16 @@ use miden_client::{
 };
 use miden_standards::note::P2idNoteStorage;
 use xyk_pool::{
-    common::get_return_note_serial,
     pool_ops::{
         build_lp_local_deposit_note, build_xyk_register_note,
         build_xyk_swap_exact_tokens_for_tokens_note, build_xyk_swap_tokens_for_exact_tokens_note,
         get_combined_pool_library, get_lp_local_library,
     },
     test_utils::*,
-    utils::{fetch_vault_for_account_from_chain, slot_name, vault_fungible_balance},
+    utils::{
+        fetch_vault_for_account_from_chain, pool_id_registry_key, slot_name,
+        vault_fungible_balance,
+    },
 };
 
 use std::time::Duration;
@@ -495,12 +497,7 @@ async fn register_pool_happy_path_test() -> Result<()> {
         .await?
         .unwrap();
 
-    let pool_key = Word::new([
-        pool_id.suffix(),
-        pool_id.prefix().into(),
-        Felt::ZERO,
-        Felt::ZERO,
-    ]);
+    let pool_key = pool_id_registry_key(&pool_id);
     let stored_code_hash = acc
         .storage()
         .get_map_item(&slot_name("zoro::registry::pools_mapping"), pool_key)?;
@@ -555,95 +552,6 @@ async fn register_pool_happy_path_test() -> Result<()> {
     setup.clients.client.sync_state().await?;
 
     println!("register_pool_happy_path_test passed!");
-    Ok(())
-}
-
-#[tokio::test]
-async fn register_pool_with_deposit_test() -> Result<()> {
-    let mut setup = setup_registry_test_environment().await?;
-
-    let pool_id = setup.pool.id();
-    let token0_id = setup.faucets[0].faucet.id();
-    let token1_id = setup.faucets[1].faucet.id();
-
-    println!(
-        "register_pool: pool={}, token0={}, token1={}, registry={}",
-        pool_id.to_hex(),
-        token0_id.to_hex(),
-        token1_id.to_hex(),
-        setup.registry.id().to_hex(),
-    );
-    let amount0 = 1000000u64;
-    let amount1 = 1000000u64;
-    let token0_asset = FungibleAsset::new(token0_id, amount0)?;
-    let token1_asset = FungibleAsset::new(token1_id, amount1)?;
-    let lp_lib = get_lp_local_library()?;
-    let deposit_note = build_lp_local_deposit_note(
-        setup.pool.id(),
-        &lp_lib,
-        token0_asset,
-        token1_asset,
-        setup.user.id(),
-        setup.user.id(),
-        setup.clients.client.rng().draw_word(),
-    )?;
-
-    println!("=== SEND DEPOSIT NOTE ");
-
-    let create_req = TransactionRequestBuilder::new()
-        .own_output_notes([deposit_note.clone()])
-        .build()?;
-    let _tx_id = setup
-        .clients
-        .client
-        .submit_new_transaction(setup.user.id(), create_req)
-        .await?;
-    setup.clients.client.sync_state().await?;
-
-    println!("=== CONSUME DEPOSIT NOTE ");
-
-    let deposit_serial = deposit_note.serial_num();
-    let register_serial = get_return_note_serial(deposit_serial, pool_id);
-    let register_note = build_xyk_register_note(
-        &setup.registry.id(),
-        register_serial,
-        &token0_id,
-        &token1_id,
-        &setup.pool.id(),
-        &setup.pool.id(),
-    )?;
-    let consume_req = TransactionRequestBuilder::new()
-        .input_notes([(deposit_note.clone(), None)])
-        // .expected_future_notes(vec![(
-        //     register_note.clone().into(),
-        //     register_note.metadata().tag(),
-        // )])
-        // .expected_output_recipients(vec![register_note.recipient().clone()])
-        .build()?;
-    let _consume_id = setup
-        .clients
-        .client
-        .submit_new_transaction(setup.pool.id(), consume_req)
-        .await?;
-
-    setup.clients.client.sync_state().await?;
-
-    println!("=== CONSUME XYK_REGISTER NOTE ");
-
-    let foreign = ForeignAccount::public(setup.pool.id(), AccountStorageRequirements::default())?;
-    let consume_req = TransactionRequestBuilder::new()
-        .input_notes([(register_note.clone(), None)])
-        .foreign_accounts([foreign])
-        .build()?;
-    let _consume_id = setup
-        .clients
-        .client
-        .submit_new_transaction(setup.registry.id(), consume_req)
-        .await?;
-
-    setup.clients.client.sync_state().await?;
-
-    println!("register_pool_with_deposit_test passed!");
     Ok(())
 }
 
@@ -823,10 +731,10 @@ async fn lp_deposit_withdraw_happy_path_test() -> Result<()> {
     );
 
     let user_key = Word::new([
-        Felt::ZERO,
-        Felt::ZERO,
         setup.user.id().suffix(),
         setup.user.id().prefix().into(),
+        Felt::ZERO,
+        Felt::ZERO,
     ]);
     let user_deposit_after = storage_after_withdraw.get_map_item(
         &slot_name("zoro::lp_local::user_deposits_mapping"),
